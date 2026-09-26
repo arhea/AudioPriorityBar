@@ -24,6 +24,7 @@ class AudioManager: ObservableObject {
 
     let priorityManager: PriorityManager
     private let deviceService: AudioDeviceService?
+    private let notifications: NotificationManager?
 
     private var connectedDevices: [AudioDevice] = []
     private var connectedDeviceUIDs: Set<String> = []
@@ -53,6 +54,7 @@ class AudioManager: ObservableObject {
     init(priorityManager: PriorityManager = PriorityManager(), live: Bool = true) {
         self.priorityManager = priorityManager
         self.deviceService = live ? AudioDeviceService() : nil
+        self.notifications = live ? NotificationManager.shared : nil
         currentMode = priorityManager.currentMode
         isCustomMode = priorityManager.isCustomMode
 
@@ -486,8 +488,32 @@ class AudioManager: ObservableObject {
         reportedOutputId = currentOutputId
         reportedInputId = currentInputId
 
-        // Change announcements hook in here; `cause` says why the defaults moved.
-        _ = (cause, previousOutputId, outputChanged, inputChanged)
+        guard outputChanged || inputChanged else { return }
+        if (outputChanged && currentOutputId != nil && currentOutputDevice == nil)
+            || (inputChanged && currentInputId != nil && currentInputDevice == nil) {
+            connectedDevices = deviceService.getDevices()
+        }
+        let changedOutput = outputChanged ? currentOutputDevice : nil
+        let changedInput = inputChanged ? currentInputDevice : nil
+
+        let reason: String
+        switch cause {
+        case .startup, .userAction:
+            return
+        case .external:
+            reason = "Changed in macOS Sound settings"
+        case .devicesChanged(let connected, let disconnected):
+            let changed = [changedOutput, changedInput].compactMap { $0 }
+            if let arrived = connected.first(where: { device in changed.contains { $0.uid == device.uid } }) {
+                reason = "\(arrived.name) connected"
+            } else if let departed = disconnected.first(where: { $0.type == .output && $0.id == previousOutputId })
+                        ?? disconnected.first {
+                reason = "\(departed.name) disconnected"
+            } else {
+                reason = "Switched to your highest-priority device"
+            }
+        }
+        notifications?.postDeviceChange(output: changedOutput, input: changedInput, reason: reason)
     }
 
     private func setupListeners() {

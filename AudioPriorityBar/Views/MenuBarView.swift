@@ -57,6 +57,7 @@ struct MenuBarView: View {
         .frame(width: 340)
         .onAppear {
             LaunchAtLoginManager.shared.refresh()
+            NotificationManager.shared.refreshAuthorizationStatus()
         }
         .onDisappear {
             if audioManager.isShowingAllDevices {
@@ -366,9 +367,20 @@ struct FooterView: View {
 
 struct SettingsMenu: View {
     @ObservedObject private var launchAtLogin = LaunchAtLoginManager.shared
+    @ObservedObject private var notifications = NotificationManager.shared
 
     var body: some View {
         Menu {
+            Toggle("Notify When Device Changes", isOn: Binding(
+                get: { notifications.isEnabled },
+                set: { notifications.setEnabled($0) }
+            ))
+            if notifications.isEnabled && notifications.isBlockedBySystem {
+                Button("Allow Notifications in System Settings…") {
+                    notifications.openSystemSettings()
+                }
+            }
+
             Toggle("Launch at Login", isOn: Binding(
                 get: { launchAtLogin.isEnabled || launchAtLogin.requiresApproval },
                 set: { launchAtLogin.setEnabled($0) }
