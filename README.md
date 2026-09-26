@@ -51,7 +51,7 @@ Or open `AudioPriorityBar.xcodeproj` in Xcode and build with ⌘R.
 ### Download Release
 Check the [Releases](https://github.com/arhea/AudioPriorityBar/releases) page for pre-built binaries. Each zip ships with a `.sha256` checksum.
 
-Builds are ad-hoc signed but not notarized, so macOS will block the first launch. Verify the checksum, then right-click the app and choose **Open**, or allow it in **System Settings > Privacy & Security**.
+Until Developer ID signing is set up (see [Releasing](#releasing)), builds are ad-hoc signed and not notarized, so macOS blocks the first launch. Verify the checksum, then right-click the app and choose **Open**, or allow it in **System Settings > Privacy & Security**. Each release's notes say whether that build is notarized.
 
 ## Usage
 
@@ -109,6 +109,39 @@ AudioPriorityBar/
     ├── MenuBarView.swift           # Popover shell, mode picker, now playing, footer
     └── DeviceListView.swift        # Sections, reorderable rows, ignored devices
 ```
+
+## Releasing
+
+`build.sh` ad-hoc signs by default. It signs with Developer ID and notarizes when credentials are present, and CI does the same on pushes to `main` and `v*` tags once the secrets below exist. Pull requests always build ad-hoc and never see the secrets.
+
+### One-time setup
+
+1. Enroll the Apple ID in the [Apple Developer Program](https://developer.apple.com/programs/enroll/).
+2. In Xcode, go to **Settings > Accounts**, add the Apple ID, then choose **Manage Certificates > + > Developer ID Application**. Note the team ID shown next to the team.
+3. In **Keychain Access**, export that certificate together with its private key as a `.p12` file, protected by a strong password.
+4. In **App Store Connect > Users and Access > Integrations > App Store Connect API**, create a key with the Developer role. Download the `.p8` file (it can only be downloaded once), and note the key ID and issuer ID.
+
+### Local builds
+
+Store the notary credentials in your keychain once, then build:
+
+```bash
+xcrun notarytool store-credentials audioprioritybar --key AuthKey_XXXX.p8 --key-id XXXX --issuer XXXX
+DEVELOPER_ID_TEAM=<team id> NOTARY_PROFILE=audioprioritybar ./build.sh
+```
+
+### CI secrets
+
+| Secret | Value |
+|---|---|
+| `APPLE_TEAM_ID` | Team ID |
+| `DEVELOPER_ID_CERT_P12` | `base64 -i cert.p12` |
+| `DEVELOPER_ID_CERT_PASSWORD` | The `.p12` password |
+| `NOTARY_API_KEY_P8` | `base64 -i AuthKey_XXXX.p8` |
+| `NOTARY_API_KEY_ID` | API key ID |
+| `NOTARY_API_ISSUER_ID` | API issuer ID |
+
+Set each one with `gh secret set <NAME> -R arhea/AudioPriorityBar`, which prompts for the value so it never lands in shell history. Then delete the local `.p12` and `.p8` files, or move them to a password manager.
 
 ## Contributing
 

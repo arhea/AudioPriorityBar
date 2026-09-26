@@ -19,6 +19,12 @@ concurrency:
 jobs:
   build:
     runs-on: macos-15
+    env:
+      # Sign and notarize only when the Developer ID secrets exist, and never for pull requests.
+      # Without them (forks, PRs, before enrollment) the build is ad-hoc signed.
+      SIGN_RELEASE: ${{ secrets.DEVELOPER_ID_CERT_P12 != '' && github.event_name != 'pull_request' }}
+    outputs:
+      signed: ${{ steps.signing.outputs.signed }}
 
     steps:
       # Third-party actions are pinned to commit SHAs so a moved tag can't change what runs.
@@ -32,8 +38,50 @@ jobs:
         with:
           xcode-version: latest-stable
 
+      - name: Report signing mode
+        id: signing
+        run: echo "signed=$SIGN_RELEASE" >> "$GITHUB_OUTPUT"
+
+      - name: Import Developer ID certificate
+        if: env.SIGN_RELEASE == 'true'
+        env:
+          CERT_P12: ${{ secrets.DEVELOPER_ID_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.DEVELOPER_ID_CERT_PASSWORD }}
+          NOTARY_KEY_P8: ${{ secrets.NOTARY_API_KEY_P8 }}
+        run: |
+          # Throwaway keychain with a random password; deleted in the cleanup step.
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          printf '%s' "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+          EXISTING=()
+          while IFS= read -r line; do
+            line="${line#"${line%%[![:space:]]*}"}"
+            EXISTING+=("${line//\"/}")
+          done < <(security list-keychains -d user)
+          security list-keychains -d user -s "$KEYCHAIN" "${EXISTING[@]}"
+
+          printf '%s' "$NOTARY_KEY_P8" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          echo "NOTARY_KEY_PATH=$RUNNER_TEMP/notary.p8" >> "$GITHUB_ENV"
+
       - name: Build
+        env:
+          DEVELOPER_ID_TEAM: ${{ env.SIGN_RELEASE == 'true' && secrets.APPLE_TEAM_ID || '' }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_API_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_API_ISSUER_ID }}
         run: ./build.sh
+
+      - name: Remove signing material
+        if: always() && env.SIGN_RELEASE == 'true'
+        run: |
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
+          rm -f "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/cert.p12"
 
       - name: Package
         run: |
@@ -72,7 +120,7 @@ jobs:
           tag_name: nightly
           name: Nightly Build
           body: |
-            Automated nightly build from the latest commit on main. Ad-hoc signed, not notarized.
+            Automated nightly build from the latest commit on main. ${{ needs.build.outputs.signed == 'true' && 'Signed with Developer ID and notarized.' || 'Ad-hoc signed, not notarized: right-click the app and choose Open on first launch.' }}
 
             **Commit:** ${{ github.sha }}
             **Date:** ${{ github.event.head_commit.timestamp }}
