@@ -37,7 +37,6 @@ fi
 
 xcodebuild -scheme AudioPriorityBar \
   -configuration Release \
-  -destination 'generic/platform=macOS' \
   -derivedDataPath .build \
   -arch arm64 -arch x86_64 \
   ONLY_ACTIVE_ARCH=NO \
