@@ -5,70 +5,151 @@ on:
     branches: [main]
     tags:
       - 'v*'
+  pull_request:
   workflow_dispatch:
 
+# Read-only by default; only the release job can write, and only after a build on main or a tag.
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-15
+    # Notarization waits on Apple; don't let a stuck submission hold a macOS runner for hours.
+    timeout-minutes: 45
+    env:
+      # Sign and notarize only when the Developer ID secrets exist, and never for pull requests.
+      # Without them (forks, PRs, before enrollment) the build is ad-hoc signed.
+      SIGN_RELEASE: ${{ secrets.DEVELOPER_ID_CERT_P12 != '' && github.event_name != 'pull_request' }}
+    outputs:
+      signed: ${{ steps.signing.outputs.signed }}
 
     steps:
+      # Third-party actions are pinned to commit SHAs so a moved tag can't change what runs.
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Set up Xcode
-        uses: maxim-lobanov/setup-xcode@v1
+        uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
         with:
           xcode-version: latest-stable
 
-      - name: Build
-        run: |
-          xcodebuild -scheme AudioPriorityBar \
-            -configuration Release \
-            -derivedDataPath build \
-            -arch arm64 -arch x86_64 \
-            ONLY_ACTIVE_ARCH=NO \
-            CODE_SIGN_IDENTITY="-" \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO \
-            build
+      - name: Test
+        run: ./test.sh
 
-      - name: Create App Bundle
+      - name: Report signing mode
+        id: signing
+        run: echo "signed=$SIGN_RELEASE" >> "$GITHUB_OUTPUT"
+
+      - name: Import Developer ID certificate
+        if: env.SIGN_RELEASE == 'true'
+        env:
+          CERT_P12: ${{ secrets.DEVELOPER_ID_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.DEVELOPER_ID_CERT_PASSWORD }}
+          NOTARY_KEY_P8: ${{ secrets.NOTARY_API_KEY_P8 }}
+        run: |
+          # Throwaway keychain with a random password; deleted in the cleanup step.
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          printf '%s' "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+          EXISTING=()
+          while IFS= read -r line; do
+            line="${line#"${line%%[![:space:]]*}"}"
+            EXISTING+=("${line//\"/}")
+          done < <(security list-keychains -d user)
+          security list-keychains -d user -s "$KEYCHAIN" "${EXISTING[@]}"
+
+          printf '%s' "$NOTARY_KEY_P8" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          echo "NOTARY_KEY_PATH=$RUNNER_TEMP/notary.p8" >> "$GITHUB_ENV"
+
+      - name: Build
+        env:
+          DEVELOPER_ID_TEAM: ${{ env.SIGN_RELEASE == 'true' && secrets.APPLE_TEAM_ID || '' }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_API_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_API_ISSUER_ID }}
+        run: ./build.sh
+
+      - name: Remove signing material
+        if: always() && env.SIGN_RELEASE == 'true'
+        run: |
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
+          rm -f "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/cert.p12"
+
+      - name: Package
         run: |
           mkdir -p release
-          cp -R build/Build/Products/Release/AudioPriorityBar.app release/
-          cd release
-          zip -r AudioPriorityBar.zip AudioPriorityBar.app
+          cd dist
+          ditto -c -k --keepParent AudioPriorityBar.app ../release/AudioPriorityBar.zip
+          cd ../release
+          shasum -a 256 AudioPriorityBar.zip > AudioPriorityBar.zip.sha256
+          cat AudioPriorityBar.zip.sha256
 
       - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: AudioPriorityBar
-          path: release/AudioPriorityBar.zip
+          path: release/
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download Artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: AudioPriorityBar
+          path: release
+
+      # The release action reuses an existing tag as-is, so move `nightly` to this commit first;
+      # otherwise the tag and source archives stay on the first nightly forever.
+      - name: Move nightly tag
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/nightly" -f sha="$GITHUB_SHA" -F force=true \
+            || gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref=refs/tags/nightly -f sha="$GITHUB_SHA"
 
       - name: Create Nightly Release
         if: github.ref == 'refs/heads/main'
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           tag_name: nightly
+          target_commitish: ${{ github.sha }}
           name: Nightly Build
           body: |
-            Automated nightly build from the latest commit on main.
+            Automated nightly build from the latest commit on main. ${{ needs.build.outputs.signed == 'true' && 'Signed with Developer ID and notarized.' || 'Ad-hoc signed, not notarized: right-click the app and choose Open on first launch.' }}
 
             **Commit:** ${{ github.sha }}
-            **Date:** ${{ github.event.head_commit.timestamp }}
-          files: release/AudioPriorityBar.zip
+            **Date:** ${{ github.event.head_commit.timestamp || 'manual run' }}
+          files: |
+            release/AudioPriorityBar.zip
+            release/AudioPriorityBar.zip.sha256
           prerelease: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create Tagged Release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
-          files: release/AudioPriorityBar.zip
+          files: |
+            release/AudioPriorityBar.zip
+            release/AudioPriorityBar.zip.sha256
           generate_release_notes: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
