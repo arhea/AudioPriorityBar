@@ -51,7 +51,8 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
         if enabled {
             requestAuthorization()
         } else {
-            UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [requestIdentifier])
+            // Device-change and battery notifications are the only kinds this app posts.
+            UNUserNotificationCenter.current().removeAllDeliveredNotifications()
         }
     }
 

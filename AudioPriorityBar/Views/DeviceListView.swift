@@ -228,6 +228,14 @@ struct DeviceRow: View {
 
     private var battery: DeviceBattery? { audioManager.battery(for: device) }
 
+    private var accessibilityStatus: String {
+        var parts = ["priority \(index + 1)"]
+        if let subtitle { parts.append(subtitle) }
+        if isMuted { parts.append("muted") }
+        if let battery { parts.append("battery \(battery.summary)") }
+        return parts.joined(separator: ", ")
+    }
+
     private var helpText: String {
         guard device.isConnected else { return "Reconnect this device to use it" }
         if isActive { return "In use · drag to change priority" }
@@ -316,8 +324,18 @@ struct DeviceRow: View {
         .help(helpText)
         .animation(Motion.snappy, value: isDragged)
         .animation(Motion.hover, value: isMuted)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(device.name), priority \(index + 1)\(isActive ? ", in use" : "")")
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(device.name)
+        .accessibilityValue(accessibilityStatus)
+        .accessibilityHint(helpText)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction {
+            audioManager.activate(device, in: section)
+        }
+        .onChange(of: index) { _ in
+            // The row moved out from under a still pointer, which won't send a hover exit.
+            isHovering = false
+        }
     }
 
     @ViewBuilder
@@ -407,11 +425,11 @@ struct DeviceActions: View {
             Button("Use Now") { audioManager.useDevice(device) }
         }
         if index > 0 {
-            Button("Make Top Priority") { move(to: 0) }
-            Button("Move Up") { move(to: index - 1) }
+            Button("Make Top Priority") { move { _ in 0 } }
+            Button("Move Up") { move { $0 - 1 } }
         }
         if index < count - 1 {
-            Button("Move Down") { move(to: index + 1) }
+            Button("Move Down") { move { $0 + 1 } }
         }
 
         if let category = section.category {
@@ -455,9 +473,12 @@ struct DeviceActions: View {
         }
     }
 
-    private func move(to destination: Int) {
+    /// Resolves the row's position when the item is chosen, not when the menu was built: the
+    /// list can change while a menu is open (a device disconnects).
+    private func move(_ destination: (Int) -> Int) {
+        guard let current = audioManager.devices(in: section).firstIndex(where: { $0.listID == device.listID }) else { return }
         withAnimation(Motion.snappy) {
-            audioManager.moveDevice(in: section, from: index, to: destination)
+            audioManager.moveDevice(in: section, from: current, to: destination(current))
         }
     }
 }

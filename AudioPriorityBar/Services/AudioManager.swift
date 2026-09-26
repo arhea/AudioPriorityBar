@@ -36,6 +36,7 @@ class AudioManager: ObservableObject {
     private let log = Logger(subsystem: "app.audioprioritybar", category: "switching")
     private var lowBatteryNotified: Set<String> = []
     private var pendingRetry: Task<Void, Never>?
+    private var volumeBeforeMute: Float?
     private var retryAttempts = 0
     private let maxRetryAttempts = 3
     /// Low-battery warnings wait until launch finishes, when notifications are authorized.
@@ -242,14 +243,25 @@ class AudioManager: ObservableObject {
         }
     }
 
-    /// Some devices only report "muted" as a zero volume, so unmuting also restores a volume.
+    /// Mutes with the device's mute control, or by zeroing the volume on devices that don't
+    /// have one. Unmuting restores the previous volume when mute was really a zero volume.
     func toggleOutputMute() {
         let unmuting = isActiveOutputMuted
         if isMuteSettable {
             deviceService?.setOutputMuted(!unmuting)
+            if unmuting && volume < 0.01 && isVolumeSettable {
+                setVolume(volumeBeforeMute ?? 0.25)
+            }
+        } else if isVolumeSettable {
+            if unmuting {
+                setVolume(volumeBeforeMute ?? 0.25)
+            } else {
+                volumeBeforeMute = volume
+                setVolume(0)
+            }
         }
-        if unmuting && volume < 0.01 && isVolumeSettable {
-            setVolume(0.25)
+        if unmuting {
+            volumeBeforeMute = nil
         }
         refreshMuteStatus()
         refreshVolume()
@@ -394,7 +406,9 @@ class AudioManager: ObservableObject {
 
     /// Moves the device at `source` so it ends up at index `destination`.
     func moveDevice(in section: DeviceSection, from source: Int, to destination: Int) {
-        guard source != destination else { return }
+        // Menus can act on indices from a list that has since changed; ignore stale ones.
+        let indices = devices(in: section).indices
+        guard source != destination, indices.contains(source), indices.contains(destination) else { return }
         let offset = destination > source ? destination + 1 : destination
         switch section {
         case .speakers: moveSpeakerDevice(from: IndexSet(integer: source), to: offset)

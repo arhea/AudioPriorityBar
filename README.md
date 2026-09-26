@@ -86,7 +86,7 @@ The **Ignored** button in the footer lists ignored and never-use devices. **Rest
 
 ### Settings
 
-The gear menu has **Notify When Device Changes**, **Launch at Login**, and **Quit**.
+The gear menu has **Show Notifications** (device changes and low headphone battery), **Keep Bluetooth Audio in High Quality**, **Launch at Login**, and **Quit**.
 
 ## How It Works
 

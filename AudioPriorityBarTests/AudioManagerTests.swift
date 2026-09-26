@@ -394,6 +394,33 @@ final class AudioManagerTests: XCTestCase {
         XCTAssertEqual(manager.currentInputId, Fixture.airPodsMaxMic.id, "clicking a device always switches to it")
     }
 
+    /// A row menu can outlive the list it was built from (a device disconnects while it's open).
+    func testMoveWithStaleIndicesIsIgnored() {
+        let manager = makeManager(devices: [Fixture.speakers, Fixture.studioDisplay, Fixture.builtInMic],
+                                  output: Fixture.speakers, input: Fixture.builtInMic)
+        let order = manager.speakerDevices
+
+        manager.moveDevice(in: .speakers, from: 1, to: 2)
+        manager.moveDevice(in: .speakers, from: 5, to: 0)
+        manager.moveDevice(in: .speakers, from: -1, to: 0)
+
+        XCTAssertEqual(manager.speakerDevices, order)
+    }
+
+    func testMuteButtonWorksOnDevicesWithoutAMuteControl() {
+        let manager = makeManager(devices: [Fixture.speakers, Fixture.builtInMic], output: Fixture.speakers, input: Fixture.builtInMic)
+        service.muteSettable = false
+        manager.setVolume(0.6)
+        manager.refreshVolume()
+
+        manager.toggleOutputMute()
+        XCTAssertTrue(manager.isActiveOutputMuted, "muted by zeroing the volume")
+
+        manager.toggleOutputMute()
+        XCTAssertFalse(manager.isActiveOutputMuted)
+        XCTAssertEqual(manager.volume, 0.6, accuracy: 0.001, "previous volume restored")
+    }
+
     // MARK: Volume, mute, battery
 
     func testUnmutingAtZeroVolumeRestoresVolume() {

@@ -185,15 +185,19 @@ struct ModeHintView: View {
     }
 
     var body: some View {
-        Text(hint)
-            .font(.system(size: 11))
-            .foregroundStyle(.secondary)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .fixedSize(horizontal: false, vertical: true)
-            .padding(.horizontal, 2)
-            .id(hint)
-            .transition(.opacity)
-            .animation(Motion.gentle, value: hint)
+        // The animation sits on a container so it also covers the swap of the `.id`'d text
+        // when the mode changes on its own (headphones connecting), not just on clicks.
+        ZStack(alignment: .leading) {
+            Text(hint)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, 2)
+                .id(hint)
+                .transition(.opacity)
+        }
+        .animation(Motion.gentle, value: hint)
     }
 }
 
@@ -425,10 +429,11 @@ struct SettingsMenu: View {
 
     var body: some View {
         Menu {
-            Toggle("Notify When Device Changes", isOn: Binding(
+            Toggle("Show Notifications", isOn: Binding(
                 get: { notifications.isEnabled },
                 set: { notifications.setEnabled($0) }
             ))
+            .help("Device changes and low headphone battery")
             if notifications.isEnabled && notifications.isBlockedBySystem {
                 Button("Allow Notifications in System Settings…") {
                     notifications.openSystemSettings()
@@ -523,6 +528,8 @@ class ScrollWheelNSView: NSView {
     var onScroll: ((CGFloat) -> Void)?
 
     override func scrollWheel(with event: NSEvent) {
+        // Momentum after the fingers lift would keep changing the volume.
+        guard event.momentumPhase.isEmpty else { return }
         // Trackpads report per-pixel deltas, mice report whole lines; scale to similar speeds.
         let step: CGFloat = event.hasPreciseScrollingDeltas ? 0.004 : 0.02
         onScroll?(event.scrollingDeltaY * step)
