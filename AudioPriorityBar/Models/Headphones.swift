@@ -104,11 +104,17 @@ struct HeadphoneDetection {
 
     /// Check if a device name matches headphone patterns
     static func isHeadphone(deviceName: String) -> Bool {
-        let nameLower = deviceName.lowercased()
-        if speakerKeywords.contains(where: { containsWord(nameLower, prefix: $0) }) {
+        if isSpeakerName(deviceName) {
             return false
         }
+        let nameLower = deviceName.lowercased()
         return keywords.contains { containsWord(nameLower, prefix: $0) }
+    }
+
+    /// Names that identify a speaker, speakerphone, or display even if other signals say headphones.
+    static func isSpeakerName(_ deviceName: String) -> Bool {
+        let nameLower = deviceName.lowercased()
+        return speakerKeywords.contains { containsWord(nameLower, prefix: $0) }
     }
 
     /// True if `prefix` occurs in `text` starting at a word boundary. Only the start is

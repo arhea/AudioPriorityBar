@@ -25,6 +25,11 @@ A native macOS menu bar app that automatically manages audio device priorities. 
 - **Ignore / never use**: Hide a device from one category or everywhere, or keep it listed but never switch to it automatically.
 - **Drag-to-reorder**: Drag rows, click a row to make it your top priority, or use the row's menu.
 - **Volume and mute**: Adjust volume with the slider or scroll wheel; click the speaker icon to mute.
+- **AirPods and Bluetooth headphones**:
+  - AirPods, AirPods Pro, AirPods Max, and Beats are recognized by model, even after you rename them. Any headphones that identify themselves as headphones (Bluetooth or the headphone jack) go to Headphones regardless of brand.
+  - Battery levels show for AirPods (left, right, and case), AirPods Max, Beats, and other Bluetooth headsets that report one, with a notification when the headphones you're listening on run low.
+  - **Keep Bluetooth Audio in High Quality** (on by default): Bluetooth headphones drop to call quality whenever their microphone is in use. The app only uses a Bluetooth mic when no other mic is available. When picking AirPods in Control Center drags the mic along, it restores your preferred mic and keeps the output.
+  - If headphones do drop to call quality, the popover says why and offers a one-click switch to another mic.
 
 ## Installation
 

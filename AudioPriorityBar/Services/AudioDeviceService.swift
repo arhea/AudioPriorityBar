@@ -7,7 +7,8 @@ class AudioDeviceService {
     var onDeviceListChanged: (() -> Void)?
     /// The default input or output device changed (by this app, macOS, or another app).
     var onDefaultDeviceChanged: (() -> Void)?
-    var onMuteOrVolumeChanged: (() -> Void)?
+    /// Mute, volume, or sample rate changed on some device.
+    var onDeviceStateChanged: (() -> Void)?
 
     private var deviceListListenerBlock: AudioObjectPropertyListenerBlock?
     private var defaultDeviceListenerBlock: AudioObjectPropertyListenerBlock?
@@ -143,7 +144,7 @@ class AudioDeviceService {
         removeMuteVolumeListeners()
 
         let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-            self?.onMuteOrVolumeChanged?()
+            self?.onDeviceStateChanged?()
         }
         muteVolumeListenerBlock = block
 
@@ -151,6 +152,8 @@ class AudioDeviceService {
             addListener(deviceId, kAudioDevicePropertyMute, block, scope: kAudioDevicePropertyScopeOutput)
             addListener(deviceId, kAudioDevicePropertyMute, block, scope: kAudioDevicePropertyScopeInput)
             addListener(deviceId, kAudioHardwareServiceDeviceProperty_VirtualMainVolume, block, scope: kAudioDevicePropertyScopeOutput)
+            // Bluetooth headphones drop their sample rate when they switch to call mode.
+            addListener(deviceId, kAudioDevicePropertyNominalSampleRate, block)
             monitoredDeviceIds.insert(deviceId)
         }
     }
@@ -162,6 +165,7 @@ class AudioDeviceService {
             removeListener(deviceId, kAudioDevicePropertyMute, block, scope: kAudioDevicePropertyScopeOutput)
             removeListener(deviceId, kAudioDevicePropertyMute, block, scope: kAudioDevicePropertyScopeInput)
             removeListener(deviceId, kAudioHardwareServiceDeviceProperty_VirtualMainVolume, block, scope: kAudioDevicePropertyScopeOutput)
+            removeListener(deviceId, kAudioDevicePropertyNominalSampleRate, block)
         }
 
         monitoredDeviceIds.removeAll()
@@ -218,8 +222,40 @@ class AudioDeviceService {
         guard let uid = getString(id, kAudioDevicePropertyDeviceUID) else { return nil }
         let transportValue: UInt32? = getValue(id, kAudioDevicePropertyTransportType)
         let transport = transportValue.map(AudioTransport.init(coreAudioValue:)) ?? .other
+        let isHeadphoneTerminal = type == .output
+            && firstStreamTerminalType(deviceId: id, scope: scope) == kAudioStreamTerminalTypeHeadphones
 
-        return AudioDevice(id: id, uid: uid, name: name, type: type, transport: transport)
+        return AudioDevice(id: id, uid: uid, name: name, type: type, transport: transport,
+                           modelUID: getString(id, kAudioDevicePropertyModelUID), isHeadphoneTerminal: isHeadphoneTerminal)
+    }
+
+    private func firstStreamTerminalType(deviceId: AudioObjectID, scope: AudioObjectPropertyScope) -> UInt32? {
+        var address = Self.address(kAudioDevicePropertyStreams, scope: scope)
+        var dataSize: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(deviceId, &address, 0, nil, &dataSize) == noErr, dataSize > 0 else { return nil }
+        var streamIds = [AudioStreamID](repeating: 0, count: Int(dataSize) / MemoryLayout<AudioStreamID>.size)
+        guard AudioObjectGetPropertyData(deviceId, &address, 0, nil, &dataSize, &streamIds) == noErr,
+              let first = streamIds.first else { return nil }
+        return getValue(first, kAudioStreamPropertyTerminalType)
+    }
+
+    /// A Bluetooth output that has dropped to a narrowband rate (≤ 24 kHz) while it supports
+    /// 44.1 kHz or more is in call mode (HFP): an app is using its microphone, and playback
+    /// quality falls until the mic is released.
+    func isInCallMode(_ device: AudioDevice) -> Bool {
+        guard device.type == .output, device.transport == .bluetooth, device.isConnected else { return false }
+        let nominal: Float64? = getValue(device.id, kAudioDevicePropertyNominalSampleRate)
+        guard let nominal, nominal > 0, nominal <= 24_000 else { return false }
+        return maxAvailableSampleRate(device.id) >= 44_100
+    }
+
+    private func maxAvailableSampleRate(_ deviceId: AudioObjectID) -> Float64 {
+        var address = Self.address(kAudioDevicePropertyAvailableNominalSampleRates)
+        var dataSize: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(deviceId, &address, 0, nil, &dataSize) == noErr, dataSize > 0 else { return 0 }
+        var ranges = [AudioValueRange](repeating: AudioValueRange(), count: Int(dataSize) / MemoryLayout<AudioValueRange>.size)
+        guard AudioObjectGetPropertyData(deviceId, &address, 0, nil, &dataSize, &ranges) == noErr else { return 0 }
+        return ranges.map(\.mMaximum).max() ?? 0
     }
 
     private func hasStreams(deviceId: AudioObjectID, scope: AudioObjectPropertyScope) -> Bool {
@@ -278,6 +314,7 @@ class AudioDeviceService {
 
     private func getString(_ objectId: AudioObjectID, _ selector: AudioObjectPropertySelector) -> String? {
         var address = Self.address(selector)
+        guard AudioObjectHasProperty(objectId, &address) else { return nil }
         var value: Unmanaged<CFString>?
         var dataSize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
         let status = AudioObjectGetPropertyData(objectId, &address, 0, nil, &dataSize, &value)

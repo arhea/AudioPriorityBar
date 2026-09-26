@@ -1,5 +1,6 @@
 import SwiftUI
 import CoreAudio
+import os
 
 @MainActor
 class AudioManager: ObservableObject {
@@ -21,9 +22,21 @@ class AudioManager: ObservableObject {
     @Published var mutedDeviceIds: Set<AudioObjectID> = []
     @Published var isActiveOutputMuted: Bool = false
     @Published var isActiveInputMuted: Bool = false
+    /// Battery per device, keyed by `listID`, for Bluetooth devices that report one.
+    @Published var batteries: [String: DeviceBattery] = [:]
+    /// Bluetooth outputs currently in call mode (HFP) because their mic is in use.
+    @Published var callModeOutputIds: Set<AudioObjectID> = []
+    /// Don't auto-select Bluetooth microphones while another mic is available, so Bluetooth
+    /// headphones stay in high-quality playback instead of dropping to call mode.
+    @Published private(set) var keepsBluetoothHighQuality: Bool = true
 
     let priorityManager: PriorityManager
     private let deviceService: AudioDeviceService?
+    private let batteryMonitor: BatteryMonitor?
+    private let log = Logger(subsystem: "app.audioprioritybar", category: "switching")
+    private var lowBatteryNotified: Set<String> = []
+    private var pendingRetry: Task<Void, Never>?
+    private var lastOutputChange: Date = .distantPast
     private let notifications: NotificationManager?
 
     private var connectedDevices: [AudioDevice] = []
@@ -54,9 +67,11 @@ class AudioManager: ObservableObject {
     init(priorityManager: PriorityManager = PriorityManager(), live: Bool = true) {
         self.priorityManager = priorityManager
         self.deviceService = live ? AudioDeviceService() : nil
+        self.batteryMonitor = live ? BatteryMonitor() : nil
         self.notifications = live ? NotificationManager.shared : nil
         currentMode = priorityManager.currentMode
         isCustomMode = priorityManager.isCustomMode
+        keepsBluetoothHighQuality = priorityManager.keepsBluetoothHighQuality
 
         guard live else { return }
         refreshDevices()
@@ -106,6 +121,74 @@ class AudioManager: ObservableObject {
 
     func isDeviceMuted(_ device: AudioDevice) -> Bool {
         mutedDeviceIds.contains(device.id)
+    }
+
+    func battery(for device: AudioDevice) -> DeviceBattery? {
+        batteries[device.listID]
+    }
+
+    func isInCallMode(_ device: AudioDevice) -> Bool {
+        device.type == .output && callModeOutputIds.contains(device.id)
+    }
+
+    /// The playing output is in call mode.
+    var isCurrentOutputInCallMode: Bool {
+        currentOutputId.map { callModeOutputIds.contains($0) } ?? false
+    }
+
+    /// When the playing Bluetooth headphones are in call mode because they're also the
+    /// default mic, the mic to switch to so they return to high quality.
+    var callModeFix: AudioDevice? {
+        guard isCurrentOutputInCallMode, let input = currentInputDevice, input.transport == .bluetooth,
+              input.name == currentOutputDevice?.name else { return nil }
+        return autoSelectionCandidates(input: true).first { $0.transport != .bluetooth }
+    }
+
+    /// A Bluetooth mic that auto-selection passes over because of the high-quality setting.
+    func isSkippedForQuality(_ device: AudioDevice) -> Bool {
+        keepsBluetoothHighQuality && device.type == .input && device.transport == .bluetooth
+            && connectedDevices.contains { $0.type == .input && $0.transport != .bluetooth }
+    }
+
+    func setKeepsBluetoothHighQuality(_ enabled: Bool) {
+        keepsBluetoothHighQuality = enabled
+        priorityManager.keepsBluetoothHighQuality = enabled
+        if !isCustomMode {
+            applyHighestPriorityInput()
+        }
+        syncCurrentDevices(cause: .userAction)
+    }
+
+    func fixCallMode() {
+        guard let fix = callModeFix else { return }
+        setInputDevice(fix)
+    }
+
+    func refreshCallMode() {
+        guard let deviceService else { return }
+        callModeOutputIds = Set(connectedDevices.filter { deviceService.isInCallMode($0) }.map(\.id))
+    }
+
+    func refreshBatteries() {
+        guard let batteryMonitor else { return }
+        let all = batteryMonitor.accessoryBatteries()
+        var result: [String: DeviceBattery] = [:]
+        for device in connectedDevices {
+            if let battery = batteryMonitor.battery(for: device, in: all) {
+                result[device.listID] = battery
+            }
+        }
+        batteries = result
+
+        // Warn once per discharge when the headphones you're listening on run low.
+        for (key, battery) in result where !battery.isLow {
+            lowBatteryNotified.remove(key)
+        }
+        if let output = currentOutputDevice, let battery = result[output.listID], battery.isLow,
+           !lowBatteryNotified.contains(output.listID) {
+            lowBatteryNotified.insert(output.listID)
+            notifications?.postLowBattery(device: output, battery: battery)
+        }
     }
 
     // MARK: - Volume and mute
@@ -177,7 +260,8 @@ class AudioManager: ObservableObject {
             var allOutputs = connectedOutputs
             for stored in priorityManager.getKnownDevices() {
                 let type: AudioDeviceType = stored.isInput ? .input : .output
-                let device = AudioDevice.disconnected(uid: stored.uid, name: stored.name, type: type, transport: stored.transport ?? .other)
+                let device = AudioDevice.disconnected(uid: stored.uid, name: stored.name, type: type, transport: stored.transport ?? .other,
+                                                      modelUID: stored.modelUID, isHeadphoneTerminal: stored.isHeadphoneTerminal ?? false)
                 guard !connectedKeys.contains(device.listID) else { continue }
                 if stored.isInput {
                     allInputs.append(device)
@@ -430,7 +514,11 @@ class AudioManager: ObservableObject {
         // Skipping no-op writes avoids a listener feedback loop during the grace period.
         guard device.isConnected, deviceService?.getCurrentDefaultDevice(type: .input) != device.id else { return }
         if deviceService?.setDefaultDevice(device.id, type: .input) == true {
+            log.notice("Input -> \(device.name, privacy: .public)")
             currentInputId = device.id
+        } else {
+            log.error("Couldn't set input to \(device.name, privacy: .public); retrying")
+            scheduleRetry()
         }
     }
 
@@ -438,7 +526,11 @@ class AudioManager: ObservableObject {
         // Skipping no-op writes avoids a listener feedback loop during the grace period.
         guard device.isConnected, deviceService?.getCurrentDefaultDevice(type: .output) != device.id else { return }
         if deviceService?.setDefaultDevice(device.id, type: .output) == true {
+            log.notice("Output -> \(device.name, privacy: .public)")
             currentOutputId = device.id
+        } else {
+            log.error("Couldn't set output to \(device.name, privacy: .public); retrying")
+            scheduleRetry()
         }
     }
 
@@ -447,7 +539,10 @@ class AudioManager: ObservableObject {
     private func autoSelectionCandidates(input: Bool, category: OutputCategory? = nil) -> [AudioDevice] {
         if input {
             let inputs = connectedDevices.filter { $0.type == .input && !priorityManager.isHidden($0) && !priorityManager.isNeverUse($0) }
-            return priorityManager.sortByPriority(inputs, type: .input)
+            let sorted = priorityManager.sortByPriority(inputs, type: .input)
+            guard keepsBluetoothHighQuality else { return sorted }
+            // Stable partition: keep priority order, but Bluetooth mics only as a last resort.
+            return sorted.filter { $0.transport != .bluetooth } + sorted.filter { $0.transport == .bluetooth }
         }
         let category = category ?? currentMode
         let outputs = connectedDevices.filter {
@@ -471,6 +566,21 @@ class AudioManager: ObservableObject {
         }
     }
 
+    /// Bluetooth devices can show up in CoreAudio a moment before they accept being the
+    /// default. Try the priorities once more shortly after a failed switch.
+    private func scheduleRetry() {
+        guard pendingRetry == nil else { return }
+        pendingRetry = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 800_000_000)
+            guard let self, !Task.isCancelled else { return }
+            self.pendingRetry = nil
+            guard !self.isCustomMode else { return }
+            self.applyHighestPriorityInput()
+            self.applyHighestPriorityOutput()
+            self.syncCurrentDevices(cause: self.lastDeviceListCause)
+        }
+    }
+
     // MARK: - Change tracking
 
     /// Reads the real defaults from CoreAudio, refreshes dependent state, and announces a
@@ -481,12 +591,17 @@ class AudioManager: ObservableObject {
         currentInputId = deviceService.getCurrentDefaultDevice(type: .input)
         refreshVolume()
         refreshMuteStatus()
+        refreshCallMode()
+        refreshBatteries()
 
         let previousOutputId = reportedOutputId
         let outputChanged = currentOutputId != reportedOutputId
         let inputChanged = currentInputId != reportedInputId
         reportedOutputId = currentOutputId
         reportedInputId = currentInputId
+        if outputChanged {
+            lastOutputChange = Date()
+        }
 
         guard outputChanged || inputChanged else { return }
         if (outputChanged && currentOutputId != nil && currentOutputDevice == nil)
@@ -524,13 +639,19 @@ class AudioManager: ObservableObject {
         deviceService.onDefaultDeviceChanged = { [weak self] in
             Task { @MainActor in self?.handleDefaultDeviceChange() }
         }
-        deviceService.onMuteOrVolumeChanged = { [weak self] in
+        deviceService.onDeviceStateChanged = { [weak self] in
             Task { @MainActor in
                 self?.refreshMuteStatus()
                 self?.refreshVolume()
+                self?.refreshCallMode()
             }
         }
         deviceService.startListening()
+
+        batteryMonitor?.onChange = { [weak self] in
+            Task { @MainActor in self?.refreshBatteries() }
+        }
+        batteryMonitor?.startMonitoring()
     }
 
     private func scheduleDeviceListRefresh() {
@@ -556,6 +677,7 @@ class AudioManager: ObservableObject {
         let cause = ChangeCause.devicesChanged(connected: connected, disconnected: disconnected)
         lastDeviceListChange = Date()
         lastDeviceListCause = cause
+        log.notice("Devices changed. Connected: \(connected.map(\.name), privacy: .public) Disconnected: \(disconnected.map(\.name), privacy: .public)")
 
         if !isCustomMode {
             autoSwitchModeIfNeeded(newlyConnected: connected)
@@ -580,9 +702,26 @@ class AudioManager: ObservableObject {
                 applyHighestPriorityOutput()
             }
             syncCurrentDevices(cause: lastDeviceListCause)
-        } else {
-            syncCurrentDevices(cause: .external)
+            return
         }
+
+        // Picking Bluetooth headphones as the output in Control Center also moves the mic
+        // to them, which drops playback to call quality as soon as any app listens. Keep
+        // the output choice but restore the preferred mic. Picking the mic on its own sticks.
+        // macOS reports the output and input changes as separate events, so "together" means
+        // the output changed in this event or just before it.
+        if keepsBluetoothHighQuality && !isCustomMode, let deviceService,
+           let newInputId = deviceService.getCurrentDefaultDevice(type: .input), newInputId != reportedInputId,
+           let newOutputId = deviceService.getCurrentDefaultDevice(type: .output),
+           newOutputId != reportedOutputId || Date().timeIntervalSince(lastOutputChange) < connectionGracePeriod,
+           let input = connectedDevices.first(where: { $0.id == newInputId && $0.type == .input }),
+           let output = connectedDevices.first(where: { $0.id == newOutputId && $0.type == .output }),
+           input.transport == .bluetooth, input.name == output.name {
+            log.notice("\(output.name, privacy: .public) took the mic along with the output; restoring the preferred mic")
+            applyHighestPriorityInput()
+        }
+        log.notice("Default device changed outside the app")
+        syncCurrentDevices(cause: .external)
     }
 
     /// Automatically switches between headphone and speaker mode based on device connections.
@@ -608,7 +747,7 @@ class AudioManager: ObservableObject {
 #if DEBUG
 extension AudioManager {
     /// Sample data for SwiftUI previews and snapshot tests. Never touches CoreAudio.
-    static func preview(mode: OutputCategory = .speaker, custom: Bool = false, showingAll: Bool = false) -> AudioManager {
+    static func preview(mode: OutputCategory = .speaker, custom: Bool = false, showingAll: Bool = false, callMode: Bool = false) -> AudioManager {
         let suite = "AudioPriorityBar.preview"
         let defaults = UserDefaults(suiteName: suite)!
         defaults.removePersistentDomain(forName: suite)
@@ -623,12 +762,13 @@ extension AudioManager {
             AudioDevice(id: 13, uid: "homepod", name: "Living Room HomePod", type: .output, transport: .airPlay),
         ]
         let headphones = [
-            AudioDevice(id: 21, uid: "airpods", name: "AirPods Pro", type: .output, transport: .bluetooth),
+            AudioDevice(id: 21, uid: "max:output", name: "AirPods Max", type: .output, transport: .bluetooth, modelUID: "201f 4c", isHeadphoneTerminal: true),
+            AudioDevice(id: 23, uid: "pro:output", name: "Work Buds", type: .output, transport: .bluetooth, modelUID: "200e 4c", isHeadphoneTerminal: true),
             AudioDevice(id: 22, uid: "jabra", name: "Jabra Evolve2 65", type: .output, transport: .usb),
         ]
         let inputs = [
             AudioDevice(id: 31, uid: "shure", name: "Shure MV7+", type: .input, transport: .usb),
-            AudioDevice(id: 21, uid: "airpods", name: "AirPods Pro", type: .input, transport: .bluetooth),
+            AudioDevice(id: 24, uid: "max:input", name: "AirPods Max", type: .input, transport: .bluetooth, modelUID: "201f 4c"),
             AudioDevice(id: 32, uid: "builtin-in", name: "MacBook Pro Microphone", type: .input, transport: .builtIn),
         ]
         manager.speakerDevices = showingAll
@@ -639,9 +779,19 @@ extension AudioManager {
         manager.hiddenSpeakerDevices = showingAll ? [] : [AudioDevice(id: 41, uid: "zoom", name: "LG UltraFine Display", type: .output, transport: .display)]
         manager.connectedDevices = speakers + headphones + inputs
         manager.currentOutputId = mode == .headphone ? 21 : 11
-        manager.currentInputId = 31
+        manager.currentInputId = callMode ? 24 : 31
         manager.volume = 0.62
         manager.mutedDeviceIds = [12]
+        manager.callModeOutputIds = callMode ? [21] : []
+        manager.batteries = [
+            "output:max:output": DeviceBattery(parts: [AccessoryBattery(name: "AirPods Max", productID: 0x201F, vendorID: 0x4C, part: .single, level: 70, isCharging: false, lowWarningLevel: 20)]),
+            "input:max:input": DeviceBattery(parts: [AccessoryBattery(name: "AirPods Max", productID: 0x201F, vendorID: 0x4C, part: .single, level: 70, isCharging: false, lowWarningLevel: 20)]),
+            "output:pro:output": DeviceBattery(parts: [
+                AccessoryBattery(name: "Work Buds", productID: 0x200E, vendorID: 0x4C, part: .left, level: 85, isCharging: false, lowWarningLevel: 20),
+                AccessoryBattery(name: "Work Buds", productID: 0x200E, vendorID: 0x4C, part: .right, level: 15, isCharging: false, lowWarningLevel: 20),
+                AccessoryBattery(name: "Work Buds", productID: 0x200E, vendorID: 0x4C, part: .case, level: 40, isCharging: false, lowWarningLevel: 20),
+            ]),
+        ]
         return manager
     }
 }

@@ -7,6 +7,8 @@ struct StoredDevice: Codable, Equatable {
     var lastSeen: Date
     /// Optional so settings written by older builds still decode.
     var transport: AudioTransport?
+    var modelUID: String?
+    var isHeadphoneTerminal: Bool?
 
     var lastSeenRelative: String {
         let now = Date()
@@ -100,11 +102,13 @@ class PriorityManager {
 
         for device in devices {
             let isInput = device.type == .input
-            let record = StoredDevice(uid: device.uid, name: device.name, isInput: isInput, lastSeen: now, transport: device.transport)
+            let record = StoredDevice(uid: device.uid, name: device.name, isInput: isInput, lastSeen: now, transport: device.transport,
+                                      modelUID: device.modelUID, isHeadphoneTerminal: device.isHeadphoneTerminal)
             if let index = known.firstIndex(where: { $0.uid == device.uid && $0.isInput == isInput }) {
                 let existing = known[index]
                 let isStale = now.timeIntervalSince(existing.lastSeen) > lastSeenResolution
-                if isStale || existing.name != device.name || existing.transport != device.transport {
+                if isStale || existing.name != device.name || existing.transport != device.transport
+                    || existing.modelUID != device.modelUID || existing.isHeadphoneTerminal != device.isHeadphoneTerminal {
                     known[index] = record
                     changed = true
                 }
@@ -204,7 +208,8 @@ class PriorityManager {
         var known = getKnownDevices()
         known = known.map { stored in
             guard stored.uid == oldUID else { return stored }
-            return StoredDevice(uid: newUID, name: stored.name, isInput: stored.isInput, lastSeen: stored.lastSeen, transport: stored.transport)
+            return StoredDevice(uid: newUID, name: stored.name, isInput: stored.isInput, lastSeen: stored.lastSeen, transport: stored.transport,
+                                modelUID: stored.modelUID, isHeadphoneTerminal: stored.isHeadphoneTerminal)
         }
         saveKnownDevices(known)
     }
@@ -229,6 +234,12 @@ class PriorityManager {
         set { defaults.set(newValue, forKey: customModeKey) }
     }
 
+    /// On unless turned off; see `AudioManager.keepsBluetoothHighQuality`.
+    var keepsBluetoothHighQuality: Bool {
+        get { defaults.object(forKey: "keepBluetoothHighQuality") as? Bool ?? true }
+        set { defaults.set(newValue, forKey: "keepBluetoothHighQuality") }
+    }
+
     // MARK: - Device Categories
 
     func getCategory(for device: AudioDevice) -> OutputCategory {
@@ -237,10 +248,7 @@ class PriorityManager {
             return category
         }
         // Default headphone-like devices to headphone category
-        if HeadphoneDetection.isHeadphone(deviceName: device.name) {
-            return .headphone
-        }
-        return .speaker
+        return device.looksLikeHeadphones ? .headphone : .speaker
     }
 
     func setCategory(_ category: OutputCategory, for device: AudioDevice) {

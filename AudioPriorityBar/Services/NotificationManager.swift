@@ -80,6 +80,20 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
         }
     }
 
+    func postLowBattery(device: AudioDevice, battery: DeviceBattery) {
+        guard isEnabled, isAvailable, let level = battery.listeningLevel else { return }
+        let content = UNMutableNotificationContent()
+        content.title = "\(device.name) battery low"
+        content.body = "\(level)% remaining"
+        content.threadIdentifier = "battery"
+        let request = UNNotificationRequest(identifier: "battery-\(device.uid)", content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error {
+                NSLog("AudioPriorityBar: failed to post notification: \(error.localizedDescription)")
+            }
+        }
+    }
+
     static func message(output: AudioDevice?, input: AudioDevice?, reason: String) -> (title: String, body: String)? {
         switch (output, input) {
         case let (output?, input?) where output.name == input.name:

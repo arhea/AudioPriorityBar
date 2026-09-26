@@ -1,4 +1,4 @@
-import Foundation
+import AppKit
 import CoreAudio
 
 enum AudioDeviceType: String, Codable {
@@ -53,6 +53,25 @@ struct AudioDevice: Identifiable, Equatable, Hashable {
     let type: AudioDeviceType
     var transport: AudioTransport = .other
     var isConnected: Bool = true
+    /// CoreAudio model UID. For Bluetooth devices it encodes the product and vendor ID.
+    var modelUID: String? = nil
+    /// The output stream declares itself as headphones (terminal type 'hdph'), which
+    /// Bluetooth headphones and wired headphone jacks do regardless of the device's name.
+    var isHeadphoneTerminal: Bool = false
+
+    /// Known Apple or Beats headphones, recognized even if renamed.
+    var product: AudioProduct? {
+        AudioProduct.lookup(modelUID: modelUID)
+    }
+
+    /// Whether this output belongs in Headphones. Name exclusions win (speakerphones and
+    /// displays), then the product ID, then the stream's terminal type, then name keywords.
+    var looksLikeHeadphones: Bool {
+        guard type == .output else { return false }
+        if HeadphoneDetection.isSpeakerName(name) { return false }
+        if product != nil || isHeadphoneTerminal { return true }
+        return HeadphoneDetection.isHeadphone(deviceName: name)
+    }
 
     var isValid: Bool {
         id != kAudioObjectUnknown
@@ -66,15 +85,16 @@ struct AudioDevice: Identifiable, Equatable, Hashable {
 
     /// SF Symbol that best describes the physical device.
     var symbolName: String {
+        if let product { return product.symbolName }
         let lower = name.lowercased()
-        if lower.contains("airpods max") { return "airpodsmax" }
-        if lower.contains("airpods pro") { return "airpodspro" }
+        if lower.contains("airpods max") { return AudioProduct.catalog[0x201F]!.symbolName }
+        if lower.contains("airpods pro") { return AudioProduct.catalog[0x200E]!.symbolName }
         if lower.contains("airpods") { return "airpods" }
         if lower.contains("homepod") { return "homepod.fill" }
         if lower.contains("iphone") { return "iphone" }
         if lower.contains("ipad") { return "ipad" }
         if lower.contains("display") { return "display" }
-        if type == .output && HeadphoneDetection.isHeadphone(deviceName: name) { return "headphones" }
+        if looksLikeHeadphones { return "headphones" }
 
         switch transport {
         case .builtIn: return "laptopcomputer"
@@ -88,8 +108,10 @@ struct AudioDevice: Identifiable, Equatable, Hashable {
     }
 
     // Create a disconnected placeholder from stored device
-    static func disconnected(uid: String, name: String, type: AudioDeviceType, transport: AudioTransport = .other) -> AudioDevice {
-        AudioDevice(id: 0, uid: uid, name: name, type: type, transport: transport, isConnected: false)
+    static func disconnected(uid: String, name: String, type: AudioDeviceType, transport: AudioTransport = .other,
+                             modelUID: String? = nil, isHeadphoneTerminal: Bool = false) -> AudioDevice {
+        AudioDevice(id: 0, uid: uid, name: name, type: type, transport: transport, isConnected: false,
+                    modelUID: modelUID, isHeadphoneTerminal: isHeadphoneTerminal)
     }
 }
 

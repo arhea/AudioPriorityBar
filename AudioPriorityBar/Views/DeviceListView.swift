@@ -220,9 +220,13 @@ struct DeviceRow: View {
         }
         if isNeverUse { return "Never selected automatically" }
         if isIgnored && audioManager.isShowingAllDevices { return "Ignored" }
+        if audioManager.isInCallMode(device) { return isActive ? "Playing · call quality" : "Call quality" }
         if isActive { return device.type == .input ? "In use" : "Playing" }
+        if audioManager.isSkippedForQuality(device) { return "Only if no other mic is available" }
         return nil
     }
+
+    private var battery: DeviceBattery? { audioManager.battery(for: device) }
 
     private var helpText: String {
         guard device.isConnected else { return "Reconnect this device to use it" }
@@ -246,12 +250,20 @@ struct DeviceRow: View {
                     .foregroundStyle(device.isConnected && !isNeverUse ? Color.primary : Color.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                if let subtitle {
-                    Text(subtitle)
-                        .font(.system(size: 10))
-                        .foregroundStyle(isActive ? Color.accentColor.opacity(0.9) : Color.secondary)
-                        .lineLimit(1)
-                        .transition(.opacity)
+                if subtitle != nil || battery != nil {
+                    HStack(spacing: 6) {
+                        if let subtitle {
+                            Text(subtitle)
+                                .foregroundStyle(audioManager.isInCallMode(device) ? Color.orange
+                                                 : isActive ? Color.accentColor.opacity(0.9) : Color.secondary)
+                        }
+                        if let battery {
+                            BatteryLabel(battery: battery)
+                        }
+                    }
+                    .font(.system(size: 10))
+                    .lineLimit(1)
+                    .transition(.opacity)
                 }
             }
 
@@ -325,6 +337,22 @@ struct DeviceRow: View {
         } else if isHovering {
             shape.fill(Color.primary.opacity(0.06))
         }
+    }
+}
+
+/// Battery icon and level; earbuds show left, right, and case.
+struct BatteryLabel: View {
+    let battery: DeviceBattery
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Image(systemName: battery.symbolName)
+                .font(.system(size: 9))
+            Text(battery.summary)
+                .monospacedDigit()
+        }
+        .foregroundStyle(battery.isLow ? Color.red : Color.secondary)
+        .help(battery.isCharging ? "Charging" : "Battery")
     }
 }
 

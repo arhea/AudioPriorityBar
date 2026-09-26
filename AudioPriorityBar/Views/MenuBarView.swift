@@ -57,6 +57,7 @@ struct MenuBarView: View {
         .frame(width: 340)
         .onAppear {
             LaunchAtLoginManager.shared.refresh()
+            audioManager.refreshBatteries()
             NotificationManager.shared.refreshAuthorizationStatus()
         }
         .onDisappear {
@@ -221,12 +222,18 @@ struct NowPlayingCard: View {
                 .shadow(color: tint.opacity(0.3), radius: 4, y: 1)
 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(output?.name ?? "No output device")
-                        .font(.system(size: 13, weight: .semibold))
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .id(output?.listID)
-                        .transition(.slideUp)
+                    HStack(spacing: 6) {
+                        Text(output?.name ?? "No output device")
+                            .font(.system(size: 13, weight: .semibold))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        if let output, let battery = audioManager.battery(for: output) {
+                            BatteryLabel(battery: battery)
+                                .font(.system(size: 10))
+                        }
+                    }
+                    .id(output?.listID)
+                    .transition(.slideUp)
 
                     HStack(spacing: 4) {
                         Image(systemName: audioManager.isActiveInputMuted ? "mic.slash.fill" : "mic.fill")
@@ -247,6 +254,11 @@ struct NowPlayingCard: View {
             }
 
             VolumeSliderView()
+
+            if audioManager.isCurrentOutputInCallMode, let output {
+                CallModeBanner(output: output)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+            }
         }
         .padding(10)
         .background(
@@ -255,6 +267,47 @@ struct NowPlayingCard: View {
         )
         .animation(Motion.gentle, value: output?.listID)
         .animation(Motion.gentle, value: input?.listID)
+        .animation(Motion.gentle, value: audioManager.isCurrentOutputInCallMode)
+    }
+}
+
+/// Explains why Bluetooth headphones sound worse while their mic is in use, and offers
+/// to switch mics when that's the cause.
+struct CallModeBanner: View {
+    @EnvironmentObject var audioManager: AudioManager
+    let output: AudioDevice
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "waveform.badge.exclamationmark")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(explanation)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let fix = audioManager.callModeFix {
+                    Button("Use \(fix.name)") {
+                        withAnimation(Motion.gentle) { audioManager.fixCallMode() }
+                    }
+                    .controlSize(.small)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(8)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.orange.opacity(0.12))
+        )
+    }
+
+    private var explanation: String {
+        if audioManager.callModeFix != nil {
+            return "\(output.name) is in call quality because it's also your microphone and an app is listening."
+        }
+        return "\(output.name) is in call quality because an app is using its microphone. Audio returns to full quality when the app stops."
     }
 }
 
@@ -366,6 +419,7 @@ struct FooterView: View {
 }
 
 struct SettingsMenu: View {
+    @EnvironmentObject var audioManager: AudioManager
     @ObservedObject private var launchAtLogin = LaunchAtLoginManager.shared
     @ObservedObject private var notifications = NotificationManager.shared
 
@@ -380,6 +434,12 @@ struct SettingsMenu: View {
                     notifications.openSystemSettings()
                 }
             }
+
+            Toggle("Keep Bluetooth Audio in High Quality", isOn: Binding(
+                get: { audioManager.keepsBluetoothHighQuality },
+                set: { audioManager.setKeepsBluetoothHighQuality($0) }
+            ))
+            .help("Use Bluetooth microphones only when no other mic is available, so headphones don't drop to call quality")
 
             Toggle("Launch at Login", isOn: Binding(
                 get: { launchAtLogin.isEnabled || launchAtLogin.requiresApproval },
