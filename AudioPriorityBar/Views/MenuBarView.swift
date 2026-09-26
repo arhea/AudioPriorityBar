@@ -487,6 +487,16 @@ struct PressableButtonStyle: ButtonStyle {
 }
 
 extension View {
+    /// `onChange` without the macOS 14 deprecation of the one-parameter form on newer SDKs.
+    @ViewBuilder
+    func onValueChange<V: Equatable>(of value: V, perform action: @escaping () -> Void) -> some View {
+        if #available(macOS 14.0, *) {
+            onChange(of: value) { action() }
+        } else {
+            onChange(of: value) { _ in action() }
+        }
+    }
+
     /// Bounces an SF Symbol when `value` changes, on macOS 14 and later.
     @ViewBuilder
     func bounceOnChange<V: Equatable>(of value: V) -> some View {

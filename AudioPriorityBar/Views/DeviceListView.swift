@@ -332,7 +332,7 @@ struct DeviceRow: View {
         .accessibilityAction {
             audioManager.activate(device, in: section)
         }
-        .onChange(of: index) { _ in
+        .onValueChange(of: index) {
             // The row moved out from under a still pointer, which won't send a hover exit.
             isHovering = false
         }

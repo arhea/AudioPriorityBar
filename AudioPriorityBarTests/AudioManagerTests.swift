@@ -70,8 +70,9 @@ final class AudioManagerTests: XCTestCase {
 
         service.connect(Fixture.studioDisplay, macOSSwitchesTo: Fixture.studioDisplay)
 
+        await waitUntil { manager.speakerDevices.contains(Fixture.studioDisplay) }
         await settle()
-        XCTAssertEqual(manager.currentOutputId, Fixture.speakers.id, "macOS's switch to a new device is undone")
+        XCTAssertEqual(service.defaultOutput, Fixture.speakers.id, "macOS's switch to a new device is undone")
         XCTAssertTrue(notifier.changes.isEmpty, "nothing changed in the end, so nothing to announce")
     }
 
@@ -84,6 +85,7 @@ final class AudioManagerTests: XCTestCase {
 
         await waitUntil { manager.currentOutputId == Fixture.speakers.id }
         await waitUntil { !self.notifier.changes.isEmpty }
+        await settle()
         XCTAssertEqual(notifier.changes.last?.reason, "Studio Display Speakers disconnected")
         XCTAssertEqual(notifier.changes.count, 1, "one event, one notification")
     }
@@ -108,9 +110,10 @@ final class AudioManagerTests: XCTestCase {
         let manager = makeManager(devices: [Fixture.speakers, Fixture.builtInMic], output: Fixture.speakers, input: Fixture.builtInMic)
 
         service.connect(Fixture.studioDisplay)
+        await waitUntil { manager.speakerDevices.contains(Fixture.studioDisplay) }
         await settle()
 
-        XCTAssertEqual(manager.currentOutputId, Fixture.speakers.id)
+        XCTAssertEqual(service.defaultOutput, Fixture.speakers.id)
         XCTAssertTrue(service.setCalls.isEmpty)
     }
 
@@ -158,9 +161,10 @@ final class AudioManagerTests: XCTestCase {
         XCTAssertTrue(manager.speakerDevices.contains(Fixture.studioDisplay), "shown for editing")
 
         service.connect(Fixture.usbMic)
+        await waitUntil { manager.inputDevices.contains(Fixture.usbMic) }
         await settle()
 
-        XCTAssertEqual(manager.currentOutputId, Fixture.speakers.id)
+        XCTAssertEqual(service.defaultOutput, Fixture.speakers.id)
     }
 
     func testNeverUseDeviceIsSkipped() {
@@ -419,6 +423,34 @@ final class AudioManagerTests: XCTestCase {
         manager.toggleOutputMute()
         XCTAssertFalse(manager.isActiveOutputMuted)
         XCTAssertEqual(manager.volume, 0.6, accuracy: 0.001, "previous volume restored")
+    }
+
+    /// If macOS's switch arrives before the device-list event, it's still a connect, not a
+    /// Control Center pick: priorities apply and the reason names the device.
+    func testDefaultChangeBeforeDeviceListEventIsTreatedAsConnect() async {
+        priorities.savePriorities([Fixture.speakers, Fixture.studioDisplay], category: .speaker)
+        let manager = makeManager(devices: [Fixture.speakers, Fixture.builtInMic], output: Fixture.speakers, input: Fixture.builtInMic,
+                                  gracePeriod: 0.05)
+        await settle(0.1)
+
+        service.connectDefaultFirst(Fixture.studioDisplay)
+
+        await waitUntil { manager.speakerDevices.contains(Fixture.studioDisplay) }
+        await settle()
+        XCTAssertEqual(service.defaultOutput, Fixture.speakers.id, "lower priority, so macOS's switch is undone")
+        XCTAssertFalse(notifier.changes.contains { $0.reason == "Changed in macOS Sound settings" })
+    }
+
+    /// A USB headset's halves share one AudioObjectID; never-use and selection stay per direction.
+    func testUSBHeadsetHalvesAreIndependent() {
+        priorities.savePriorities([Fixture.usbHeadsetIn, Fixture.builtInMic], type: .input)
+        priorities.setNeverUse(Fixture.usbHeadsetIn, neverUse: true)
+        let manager = makeManager(devices: [Fixture.speakers, Fixture.usbHeadsetOut, Fixture.usbHeadsetIn, Fixture.builtInMic],
+                                  output: Fixture.speakers, input: Fixture.usbHeadsetIn)
+
+        XCTAssertEqual(manager.currentInputId, Fixture.builtInMic.id, "never-use mic skipped")
+        manager.setAutoMode(.headphone)
+        XCTAssertEqual(manager.currentOutputId, Fixture.usbHeadsetOut.id, "the headset's output is still usable")
     }
 
     // MARK: Volume, mute, battery

@@ -91,6 +91,13 @@ final class FakeAudioDeviceService: AudioDeviceControlling {
         }
     }
 
+    /// macOS switches to a device before the device-list event for it arrives.
+    func connectDefaultFirst(_ device: AudioDevice) {
+        devices.append(device)
+        setDefault(device.id, type: device.type)
+        DispatchQueue.main.async { [weak self] in self?.onDeviceListChanged?() }
+    }
+
     /// A device-list event with no visible change, e.g. a call app creating a hidden aggregate.
     func publishHiddenDeviceChange() {
         onDeviceListChanged?()
@@ -102,6 +109,8 @@ final class FakeAudioDeviceService: AudioDeviceControlling {
     }
 
     private func setDefault(_ id: AudioObjectID, type: AudioDeviceType) {
+        // Like CoreAudio, only an actual change notifies.
+        guard getCurrentDefaultDevice(type: type) != id else { return }
         if type == .input { defaultInput = id } else { defaultOutput = id }
         // CoreAudio delivers listener callbacks on the main queue after the change.
         DispatchQueue.main.async { [weak self] in self?.onDefaultDeviceChanged?() }
@@ -144,6 +153,11 @@ enum Fixture {
     static let airPodsPro = AudioDevice(id: 32, uid: "pro:output", name: "AirPods Pro", type: .output, transport: .bluetooth,
                                         modelUID: "200e 4c", isHeadphoneTerminal: true)
 
+    /// A USB headset: one CoreAudio device, so both halves share an ID and a UID.
+    static let usbHeadsetOut = AudioDevice(id: 40, uid: "usb-headset", name: "Logitech USB Headset", type: .output,
+                                           transport: .usb, isHeadphoneTerminal: true)
+    static let usbHeadsetIn = AudioDevice(id: 40, uid: "usb-headset", name: "Logitech USB Headset", type: .input, transport: .usb)
+
     static func battery(_ name: String, _ part: AccessoryBattery.Part, _ level: Int, charging: Bool = false,
                         product: Int = 0x201F) -> AccessoryBattery {
         AccessoryBattery(name: name, productID: product, vendorID: 0x4C, part: part, level: level,
@@ -151,12 +165,18 @@ enum Fixture {
     }
 }
 
-/// A PriorityManager backed by a throwaway defaults suite, never the real app settings.
-func makePriorityManager(_ name: String = UUID().uuidString, legacy: UserDefaults? = nil) -> (PriorityManager, UserDefaults) {
-    let suite = "AudioPriorityBarTests.\(name)"
-    let defaults = UserDefaults(suiteName: suite)!
-    defaults.removePersistentDomain(forName: suite)
-    return (PriorityManager(defaults: defaults, legacyDefaults: legacy), defaults)
+extension XCTestCase {
+    /// A PriorityManager backed by a throwaway defaults suite, never the real app settings.
+    /// The suite is deleted after the test so runs don't pile up files in ~/Library/Preferences.
+    func makePriorityManager(_ name: String = UUID().uuidString, legacy: UserDefaults? = nil) -> (PriorityManager, UserDefaults) {
+        let suite = "AudioPriorityBarTests.\(name)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+        addTeardownBlock {
+            defaults.removePersistentDomain(forName: suite)
+        }
+        return (PriorityManager(defaults: defaults, legacyDefaults: legacy), defaults)
+    }
 }
 
 // MARK: - Async helpers

@@ -770,6 +770,19 @@ class AudioManager: ObservableObject {
         // Let that refresh apply priorities and announce the change with the right reason.
         guard pendingDeviceListRefresh == nil else { return }
 
+        // A default we haven't listed yet means a device arrived and its device-list event
+        // hasn't. Handle it as the connect it is, not as the user picking something.
+        if let deviceService {
+            let unknownDefault = [AudioDeviceType.output, .input].contains { type in
+                guard let id = deviceService.getCurrentDefaultDevice(type: type) else { return false }
+                return !connectedDevices.contains { $0.id == id && $0.type == type }
+            }
+            if unknownDefault {
+                scheduleDeviceListRefresh()
+                return
+            }
+        }
+
         let withinGracePeriod = Date().timeIntervalSince(lastDeviceListChange) < connectionGracePeriod
         if withinGracePeriod {
             if !isCustomMode {
