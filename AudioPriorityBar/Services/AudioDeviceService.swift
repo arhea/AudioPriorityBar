@@ -2,7 +2,26 @@ import Foundation
 import CoreAudio
 import AudioToolbox
 
-class AudioDeviceService {
+/// The CoreAudio operations `AudioManager` relies on. Tests substitute a fake so the
+/// switching logic can be exercised without touching real devices.
+protocol AudioDeviceControlling: AnyObject {
+    var onDeviceListChanged: (() -> Void)? { get set }
+    var onDefaultDeviceChanged: (() -> Void)? { get set }
+    var onDeviceStateChanged: (() -> Void)? { get set }
+    func startListening()
+    func getDevices() -> [AudioDevice]
+    func getCurrentDefaultDevice(type: AudioDeviceType) -> AudioObjectID?
+    @discardableResult func setDefaultDevice(_ deviceId: AudioObjectID, type: AudioDeviceType) -> Bool
+    func getOutputVolume() -> Float
+    func isOutputVolumeSettable() -> Bool
+    func setOutputVolume(_ volume: Float)
+    func isOutputMuteSettable() -> Bool
+    func setOutputMuted(_ muted: Bool)
+    func isDeviceMuted(_ deviceId: AudioObjectID, type: AudioDeviceType) -> Bool
+    func isInCallMode(_ device: AudioDevice) -> Bool
+}
+
+class AudioDeviceService: AudioDeviceControlling {
     /// Devices were added or removed.
     var onDeviceListChanged: (() -> Void)?
     /// The default input or output device changed (by this app, macOS, or another app).

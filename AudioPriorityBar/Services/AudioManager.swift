@@ -31,13 +31,13 @@ class AudioManager: ObservableObject {
     @Published private(set) var keepsBluetoothHighQuality: Bool = true
 
     let priorityManager: PriorityManager
-    private let deviceService: AudioDeviceService?
+    private let deviceService: AudioDeviceControlling?
     private let batteryMonitor: BatteryMonitor?
     private let log = Logger(subsystem: "app.audioprioritybar", category: "switching")
     private var lowBatteryNotified: Set<String> = []
     private var pendingRetry: Task<Void, Never>?
     private var lastOutputChange: Date = .distantPast
-    private let notifications: NotificationManager?
+    private let notifications: DeviceChangeNotifying?
 
     private var connectedDevices: [AudioDevice] = []
     private var connectedDeviceUIDs: Set<String> = []
@@ -52,10 +52,12 @@ class AudioManager: ObservableObject {
     private var lastDeviceListCause: ChangeCause = .startup
 
     /// Bluetooth devices publish their input and output halves separately; wait for both.
-    private let deviceListDebounce: UInt64 = 250_000_000
+    private let deviceListDebounce: TimeInterval
     /// macOS often switches to a newly connected device a beat after publishing it. A default
     /// change inside this window is macOS, not the user, so priorities still apply.
-    private let connectionGracePeriod: TimeInterval = 2
+    private let connectionGracePeriod: TimeInterval
+    /// How long to wait before retrying a device that refused to become the default.
+    private let retryDelay: TimeInterval
 
     enum ChangeCause {
         case startup
@@ -64,16 +66,39 @@ class AudioManager: ObservableObject {
         case external
     }
 
-    init(priorityManager: PriorityManager = PriorityManager(), live: Bool = true) {
+    /// The app's manager, wired to CoreAudio, IOKit, and notifications.
+    convenience init() {
+        self.init(
+            priorityManager: PriorityManager(),
+            deviceService: AudioDeviceService(),
+            batteryMonitor: BatteryMonitor(),
+            notifications: NotificationManager.shared
+        )
+    }
+
+    /// Pass `nil` for `deviceService` to get an inert manager (previews); tests pass fakes
+    /// and shorter timings.
+    init(
+        priorityManager: PriorityManager,
+        deviceService: AudioDeviceControlling?,
+        batteryMonitor: BatteryMonitor?,
+        notifications: DeviceChangeNotifying?,
+        deviceListDebounce: TimeInterval = 0.25,
+        connectionGracePeriod: TimeInterval = 2,
+        retryDelay: TimeInterval = 0.8
+    ) {
         self.priorityManager = priorityManager
-        self.deviceService = live ? AudioDeviceService() : nil
-        self.batteryMonitor = live ? BatteryMonitor() : nil
-        self.notifications = live ? NotificationManager.shared : nil
+        self.deviceService = deviceService
+        self.batteryMonitor = batteryMonitor
+        self.notifications = notifications
+        self.deviceListDebounce = deviceListDebounce
+        self.connectionGracePeriod = connectionGracePeriod
+        self.retryDelay = retryDelay
         currentMode = priorityManager.currentMode
         isCustomMode = priorityManager.isCustomMode
         keepsBluetoothHighQuality = priorityManager.keepsBluetoothHighQuality
 
-        guard live else { return }
+        guard deviceService != nil else { return }
         refreshDevices()
         previousConnectedDevices = connectedDevices
         setupListeners()
@@ -570,8 +595,8 @@ class AudioManager: ObservableObject {
     /// default. Try the priorities once more shortly after a failed switch.
     private func scheduleRetry() {
         guard pendingRetry == nil else { return }
-        pendingRetry = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 800_000_000)
+        pendingRetry = Task { @MainActor [weak self, retryDelay] in
+            try? await Task.sleep(nanoseconds: UInt64(retryDelay * 1_000_000_000))
             guard let self, !Task.isCancelled else { return }
             self.pendingRetry = nil
             guard !self.isCustomMode else { return }
@@ -658,7 +683,7 @@ class AudioManager: ObservableObject {
         lastDeviceListChange = Date()
         pendingDeviceListRefresh?.cancel()
         pendingDeviceListRefresh = Task { @MainActor [weak self, deviceListDebounce] in
-            try? await Task.sleep(nanoseconds: deviceListDebounce)
+            try? await Task.sleep(nanoseconds: UInt64(deviceListDebounce * 1_000_000_000))
             guard !Task.isCancelled else { return }
             self?.pendingDeviceListRefresh = nil
             self?.handleDeviceListChange()
@@ -751,7 +776,8 @@ extension AudioManager {
         let suite = "AudioPriorityBar.preview"
         let defaults = UserDefaults(suiteName: suite)!
         defaults.removePersistentDomain(forName: suite)
-        let manager = AudioManager(priorityManager: PriorityManager(defaults: defaults, legacyDefaults: nil), live: false)
+        let manager = AudioManager(priorityManager: PriorityManager(defaults: defaults, legacyDefaults: nil),
+                                   deviceService: nil, batteryMonitor: nil, notifications: nil)
         manager.currentMode = mode
         manager.isCustomMode = custom
         manager.isShowingAllDevices = showingAll

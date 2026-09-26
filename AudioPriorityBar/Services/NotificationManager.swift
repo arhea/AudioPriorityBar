@@ -1,10 +1,17 @@
 import AppKit
 import UserNotifications
 
+/// Where `AudioManager` sends announcements; tests record them instead.
+@MainActor
+protocol DeviceChangeNotifying: AnyObject {
+    func postDeviceChange(output: AudioDevice?, input: AudioDevice?, reason: String)
+    func postLowBattery(device: AudioDevice, battery: DeviceBattery)
+}
+
 /// Posts a notification when the default output or microphone changes on its own:
 /// a device connects or disconnects, or another app or macOS switches it.
 @MainActor
-final class NotificationManager: NSObject, ObservableObject, UNUserNotificationCenterDelegate {
+final class NotificationManager: NSObject, ObservableObject, UNUserNotificationCenterDelegate, DeviceChangeNotifying {
     static let shared = NotificationManager()
 
     @Published private(set) var isEnabled: Bool
@@ -94,7 +101,7 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
         }
     }
 
-    static func message(output: AudioDevice?, input: AudioDevice?, reason: String) -> (title: String, body: String)? {
+    nonisolated static func message(output: AudioDevice?, input: AudioDevice?, reason: String) -> (title: String, body: String)? {
         switch (output, input) {
         case let (output?, input?) where output.name == input.name:
             return ("Now using \(output.name)", "Sound output and microphone · \(reason)")

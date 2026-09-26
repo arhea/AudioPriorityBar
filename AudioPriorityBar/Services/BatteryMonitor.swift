@@ -85,8 +85,15 @@ final class BatteryMonitor {
 
     var onChange: (() -> Void)?
     private var runLoopSource: CFRunLoopSource?
+    private let source: (() -> [AccessoryBattery])?
+
+    /// `source` replaces the IOKit lookup, for tests.
+    init(source: (() -> [AccessoryBattery])? = nil) {
+        self.source = source
+    }
 
     func accessoryBatteries() -> [AccessoryBattery] {
+        if let source { return source() }
         guard let copy = Self.copyPowerSourcesByType,
               let info = copy(Self.accessorySourceType)?.takeRetainedValue(),
               let list = IOPSCopyPowerSourcesList(info)?.takeRetainedValue() as? [CFTypeRef] else {
@@ -130,7 +137,7 @@ final class BatteryMonitor {
 
     /// Calls `onChange` whenever any power source changes, including accessory batteries.
     func startMonitoring() {
-        guard runLoopSource == nil else { return }
+        guard runLoopSource == nil, source == nil else { return }
         let context = Unmanaged.passUnretained(self).toOpaque()
         guard let source = IOPSNotificationCreateRunLoopSource({ context in
             guard let context else { return }
