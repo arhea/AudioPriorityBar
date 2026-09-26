@@ -115,6 +115,24 @@ AudioPriorityBar/
     └── DeviceListView.swift        # Sections, reorderable rows, ignored devices
 ```
 
+## Testing
+
+```bash
+./test.sh
+```
+
+The `AudioPriorityBarTests` target compiles the app's sources directly instead of running inside the app. That's deliberate: launching the real app during tests would switch your audio devices. CI runs the suite on every pull request and push, before building.
+
+| Suite | Covers |
+|---|---|
+| `AudioManagerTests` | Auto-switching against a fake CoreAudio: connect/disconnect, headphone mode, manual mode, respecting Control Center picks, ignored and never-use devices, reordering, Bluetooth high-quality mic policy, call mode, retry, mute, low-battery alerts, notification reasons |
+| `PriorityManagerTests` | Priority merging, UID migration (and when it must not happen), known devices, legacy settings import |
+| `DeviceDetectionTests` | Headphone vs. speaker names, AirPods/Beats product IDs, terminal type, list identity |
+| `BatteryTests`, `NotificationMessageTests` | Battery summaries and matching, notification text |
+| `MenuBarLayoutTests` | Renders the real popover and fails if the device list collapses, as it did on macOS 26 |
+
+When you add a source file to the app, add it to the test target too (**Target Membership** in Xcode). Otherwise the test build fails with a missing symbol.
+
 ## Releasing
 
 `build.sh` ad-hoc signs by default. It signs with Developer ID and notarizes when credentials are present, and CI does the same on pushes to `main` and `v*` tags once the secrets below exist. Pull requests always build ad-hoc and never see the secrets.

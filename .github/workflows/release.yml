@@ -38,6 +38,9 @@ jobs:
         with:
           xcode-version: latest-stable
 
+      - name: Test
+        run: ./test.sh
+
       - name: Report signing mode
         id: signing
         run: echo "signed=$SIGN_RELEASE" >> "$GITHUB_OUTPUT"
