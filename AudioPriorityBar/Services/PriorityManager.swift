@@ -5,6 +5,8 @@ struct StoredDevice: Codable, Equatable {
     let name: String
     let isInput: Bool
     var lastSeen: Date
+    /// Optional so settings written by older builds still decode.
+    var transport: AudioTransport?
 
     var lastSeenRelative: String {
         let now = Date()
@@ -32,7 +34,7 @@ struct StoredDevice: Codable, Equatable {
 }
 
 class PriorityManager {
-    private let defaults = UserDefaults.standard
+    private let defaults: UserDefaults
 
     private let inputPrioritiesKey = "inputPriorities"
     private let speakerPrioritiesKey = "speakerPriorities"
@@ -40,8 +42,44 @@ class PriorityManager {
     private let deviceCategoriesKey = "deviceCategories"
     private let currentModeKey = "currentMode"
     private let customModeKey = "customMode"
-    private let hiddenDevicesKey = "hiddenDevices"
     private let knownDevicesKey = "knownDevices"
+    private let neverUseKey = "neverUseDevices"
+    private let hiddenMicsKey = "hiddenMics"
+    private let hiddenSpeakersKey = "hiddenSpeakers"
+    private let hiddenHeadphonesKey = "hiddenHeadphones"
+    private let legacyImportKey = "didImportLegacySettings"
+
+    /// Bundle ID used by releases before the switch to `app.audioprioritybar`.
+    static let legacyDomain = "com.example.AudioPriorityBar"
+
+    /// Only rewrite a device's lastSeen this often, so routine refreshes don't hit disk.
+    private let lastSeenResolution: TimeInterval = 60
+
+    init(defaults: UserDefaults = .standard, legacyDefaults: UserDefaults? = UserDefaults(suiteName: PriorityManager.legacyDomain)) {
+        self.defaults = defaults
+        importLegacySettingsIfNeeded(from: legacyDefaults)
+    }
+
+    // MARK: - Legacy settings
+
+    /// Releases before the bundle ID change stored everything under `com.example.AudioPriorityBar`,
+    /// so upgrading silently reset every priority list. Copy those settings over once.
+    private func importLegacySettingsIfNeeded(from legacy: UserDefaults?) {
+        guard !defaults.bool(forKey: legacyImportKey) else { return }
+        defaults.set(true, forKey: legacyImportKey)
+
+        guard let legacy, defaults.object(forKey: knownDevicesKey) == nil else { return }
+        let keys = [
+            inputPrioritiesKey, speakerPrioritiesKey, headphonePrioritiesKey, deviceCategoriesKey,
+            currentModeKey, customModeKey, knownDevicesKey, neverUseKey,
+            hiddenMicsKey, hiddenSpeakersKey, hiddenHeadphonesKey,
+        ]
+        for key in keys {
+            if let value = legacy.object(forKey: key) {
+                defaults.set(value, forKey: key)
+            }
+        }
+    }
 
     // MARK: - Known Devices (Persistent Memory)
 
@@ -53,25 +91,42 @@ class PriorityManager {
         return devices
     }
 
-    func rememberDevice(_ uid: String, name: String, isInput: Bool) {
+    /// Records every connected device in one read/write. Devices are keyed by UID *and*
+    /// direction, because a USB headset publishes its input and output under one UID.
+    func rememberDevices(_ devices: [AudioDevice]) {
         var known = getKnownDevices()
         let now = Date()
-        if let index = known.firstIndex(where: { $0.uid == uid }) {
-            // Update name and lastSeen
-            known[index] = StoredDevice(uid: uid, name: name, isInput: isInput, lastSeen: now)
-        } else {
-            known.append(StoredDevice(uid: uid, name: name, isInput: isInput, lastSeen: now))
+        var changed = false
+
+        for device in devices {
+            let isInput = device.type == .input
+            let record = StoredDevice(uid: device.uid, name: device.name, isInput: isInput, lastSeen: now, transport: device.transport)
+            if let index = known.firstIndex(where: { $0.uid == device.uid && $0.isInput == isInput }) {
+                let existing = known[index]
+                let isStale = now.timeIntervalSince(existing.lastSeen) > lastSeenResolution
+                if isStale || existing.name != device.name || existing.transport != device.transport {
+                    known[index] = record
+                    changed = true
+                }
+            } else {
+                known.append(record)
+                changed = true
+            }
         }
-        saveKnownDevices(known)
+
+        if changed {
+            saveKnownDevices(known)
+        }
     }
 
-    func getStoredDevice(uid: String) -> StoredDevice? {
-        getKnownDevices().first { $0.uid == uid }
+    func getStoredDevice(uid: String, isInput: Bool) -> StoredDevice? {
+        getKnownDevices().first { $0.uid == uid && $0.isInput == isInput }
     }
 
-    func forgetDevice(_ uid: String) {
+    func forgetDevice(_ device: AudioDevice) {
+        let isInput = device.type == .input
         var known = getKnownDevices()
-        known.removeAll { $0.uid == uid }
+        known.removeAll { $0.uid == device.uid && $0.isInput == isInput }
         saveKnownDevices(known)
     }
 
@@ -79,6 +134,79 @@ class PriorityManager {
         if let data = try? JSONEncoder().encode(devices) {
             defaults.set(data, forKey: knownDevicesKey)
         }
+    }
+
+    // MARK: - Reconnects with a new UID
+
+    /// Some devices (Studio Display, many docks) embed the USB port path in their UID, so
+    /// they come back under a new UID after a replug. When a device with an unknown UID
+    /// matches exactly one disconnected known device by name and direction, move that
+    /// device's settings to the new UID instead of treating it as brand new.
+    ///
+    /// Must run before `rememberDevices`, which would otherwise make the new UID "known".
+    func migrateReconnectedDevices(_ connected: [AudioDevice]) {
+        let known = getKnownDevices()
+        let knownKeys = Set(known.map { "\($0.isInput):\($0.uid)" })
+        let connectedUIDs = Set(connected.map(\.uid))
+        let unknownDevices = connected.filter { !knownKeys.contains("\($0.type == .input):\($0.uid)") }
+
+        var migrated: [String: String] = [:]
+        // Bluetooth UIDs are the device's MAC address and never change.
+        for device in unknownDevices where device.transport != .bluetooth {
+            let isInput = device.type == .input
+            // Two new devices sharing a name (e.g. identical mics) is ambiguous; leave them alone.
+            let sameNameNewDevices = unknownDevices.filter { $0.name == device.name && $0.type == device.type }
+            // Transport must match too, so a different generic "USB Audio Device" plugged into a
+            // dock can't inherit another one's settings. Records from older builds have no transport.
+            let candidates = known.filter {
+                $0.name == device.name && $0.isInput == isInput && !connectedUIDs.contains($0.uid)
+                    && ($0.transport == nil || $0.transport == device.transport)
+            }
+            guard sameNameNewDevices.count == 1, candidates.count == 1 else { continue }
+
+            let oldUID = candidates[0].uid
+            if let existing = migrated[oldUID] {
+                // The other half of the same physical device already moved; it must agree.
+                if existing != device.uid { continue }
+            } else {
+                migrated[oldUID] = device.uid
+            }
+        }
+
+        for (oldUID, newUID) in migrated {
+            replaceUID(oldUID, with: newUID)
+        }
+    }
+
+    private func replaceUID(_ oldUID: String, with newUID: String) {
+        let listKeys = [
+            inputPrioritiesKey, speakerPrioritiesKey, headphonePrioritiesKey,
+            neverUseKey, hiddenMicsKey, hiddenSpeakersKey, hiddenHeadphonesKey,
+        ]
+        for key in listKeys {
+            guard var list = defaults.stringArray(forKey: key), list.contains(oldUID) else { continue }
+            if list.contains(newUID) {
+                list.removeAll { $0 == oldUID }
+            } else {
+                list = list.map { $0 == oldUID ? newUID : $0 }
+            }
+            defaults.set(list, forKey: key)
+        }
+
+        var categories = defaults.dictionary(forKey: deviceCategoriesKey) as? [String: String] ?? [:]
+        if let category = categories.removeValue(forKey: oldUID) {
+            if categories[newUID] == nil {
+                categories[newUID] = category
+            }
+            defaults.set(categories, forKey: deviceCategoriesKey)
+        }
+
+        var known = getKnownDevices()
+        known = known.map { stored in
+            guard stored.uid == oldUID else { return stored }
+            return StoredDevice(uid: newUID, name: stored.name, isInput: stored.isInput, lastSeen: stored.lastSeen, transport: stored.transport)
+        }
+        saveKnownDevices(known)
     }
 
     // MARK: - Mode Management
@@ -123,15 +251,13 @@ class PriorityManager {
 
     // MARK: - Never Use Devices (never auto-selected)
 
-    private let neverUseKey = "neverUseDevices"
-
     func isNeverUse(_ device: AudioDevice) -> Bool {
-        let list = defaults.array(forKey: neverUseKey) as? [String] ?? []
+        let list = defaults.stringArray(forKey: neverUseKey) ?? []
         return list.contains(device.uid)
     }
 
     func setNeverUse(_ device: AudioDevice, neverUse: Bool) {
-        var list = defaults.array(forKey: neverUseKey) as? [String] ?? []
+        var list = defaults.stringArray(forKey: neverUseKey) ?? []
         if neverUse {
             if !list.contains(device.uid) {
                 list.append(device.uid)
@@ -144,25 +270,21 @@ class PriorityManager {
 
     // MARK: - Hidden Devices (per category)
 
-    private let hiddenMicsKey = "hiddenMics"
-    private let hiddenSpeakersKey = "hiddenSpeakers"
-    private let hiddenHeadphonesKey = "hiddenHeadphones"
-
     func isHidden(_ device: AudioDevice) -> Bool {
         let key = hiddenKey(for: device)
-        let hidden = defaults.array(forKey: key) as? [String] ?? []
+        let hidden = defaults.stringArray(forKey: key) ?? []
         return hidden.contains(device.uid)
     }
 
     func isHidden(_ device: AudioDevice, inCategory category: OutputCategory) -> Bool {
         let key = category == .speaker ? hiddenSpeakersKey : hiddenHeadphonesKey
-        let hidden = defaults.array(forKey: key) as? [String] ?? []
+        let hidden = defaults.stringArray(forKey: key) ?? []
         return hidden.contains(device.uid)
     }
 
     func hideDevice(_ device: AudioDevice) {
         let key = hiddenKey(for: device)
-        var hidden = defaults.array(forKey: key) as? [String] ?? []
+        var hidden = defaults.stringArray(forKey: key) ?? []
         if !hidden.contains(device.uid) {
             hidden.append(device.uid)
             defaults.set(hidden, forKey: key)
@@ -171,7 +293,7 @@ class PriorityManager {
 
     func hideDevice(_ device: AudioDevice, inCategory category: OutputCategory) {
         let key = category == .speaker ? hiddenSpeakersKey : hiddenHeadphonesKey
-        var hidden = defaults.array(forKey: key) as? [String] ?? []
+        var hidden = defaults.stringArray(forKey: key) ?? []
         if !hidden.contains(device.uid) {
             hidden.append(device.uid)
             defaults.set(hidden, forKey: key)
@@ -180,14 +302,14 @@ class PriorityManager {
 
     func unhideDevice(_ device: AudioDevice) {
         let key = hiddenKey(for: device)
-        var hidden = defaults.array(forKey: key) as? [String] ?? []
+        var hidden = defaults.stringArray(forKey: key) ?? []
         hidden.removeAll { $0 == device.uid }
         defaults.set(hidden, forKey: key)
     }
 
     func unhideDevice(_ device: AudioDevice, fromCategory category: OutputCategory) {
         let key = category == .speaker ? hiddenSpeakersKey : hiddenHeadphonesKey
-        var hidden = defaults.array(forKey: key) as? [String] ?? []
+        var hidden = defaults.stringArray(forKey: key) ?? []
         hidden.removeAll { $0 == device.uid }
         defaults.set(hidden, forKey: key)
     }
@@ -239,18 +361,51 @@ class PriorityManager {
         }
     }
 
+    /// Ranked devices first in stored order; unranked devices after, in their original
+    /// order. `sorted(by:)` isn't stable, so ties are broken by original position.
     private func sortDevices(_ devices: [AudioDevice], usingKey key: String) -> [AudioDevice] {
-        let priorities = defaults.array(forKey: key) as? [String] ?? []
-
-        return devices.sorted { a, b in
-            let indexA = priorities.firstIndex(of: a.uid) ?? Int.max
-            let indexB = priorities.firstIndex(of: b.uid) ?? Int.max
-            return indexA < indexB
+        let priorities = defaults.stringArray(forKey: key) ?? []
+        var rank: [String: Int] = [:]
+        for (index, uid) in priorities.enumerated() where rank[uid] == nil {
+            rank[uid] = index
         }
+
+        return devices.enumerated().sorted { a, b in
+            let rankA = rank[a.element.uid] ?? Int.max
+            let rankB = rank[b.element.uid] ?? Int.max
+            if rankA != rankB { return rankA < rankB }
+            return a.offset < b.offset
+        }.map(\.element)
     }
 
+    /// Merges the new order of `devices` into the stored list instead of replacing it.
+    /// The list shown in the UI only has visible devices; overwriting the stored list with
+    /// it used to wipe the position of every disconnected or ignored device.
     private func savePriorities(_ devices: [AudioDevice], key: String) {
-        let uids = devices.map { $0.uid }
-        defaults.set(uids, forKey: key)
+        let stored = defaults.stringArray(forKey: key) ?? []
+        let newOrder = devices.map(\.uid)
+        defaults.set(Self.mergeOrder(stored: stored, visibleOrder: newOrder), forKey: key)
+    }
+
+    /// Slots held by visible devices in `stored` are refilled with `visibleOrder`, so hidden
+    /// devices keep their position. Visible devices that weren't stored yet are appended.
+    static func mergeOrder(stored: [String], visibleOrder: [String]) -> [String] {
+        var seen = Set<String>()
+        let stored = stored.filter { seen.insert($0).inserted }
+        let visible = Set(visibleOrder)
+
+        var remaining = visibleOrder[...]
+        var merged: [String] = []
+        for uid in stored {
+            if visible.contains(uid) {
+                if let next = remaining.popFirst() {
+                    merged.append(next)
+                }
+            } else {
+                merged.append(uid)
+            }
+        }
+        merged.append(contentsOf: remaining)
+        return merged
     }
 }

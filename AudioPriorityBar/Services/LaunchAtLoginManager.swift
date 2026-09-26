@@ -2,60 +2,38 @@ import Foundation
 import ServiceManagement
 
 @MainActor
-class LaunchAtLoginManager: ObservableObject {
+final class LaunchAtLoginManager: ObservableObject {
     static let shared = LaunchAtLoginManager()
-    
-    @Published var isEnabled: Bool {
-        didSet {
-            if isEnabled {
-                enableLaunchAtLogin()
-            } else {
-                disableLaunchAtLogin()
-            }
-        }
-    }
-    
+
+    @Published private(set) var isEnabled = false
+    /// Registered, but the user still has to allow it in System Settings > Login Items.
+    @Published private(set) var requiresApproval = false
+
     private init() {
-        // Check current status
-        if #available(macOS 13.0, *) {
-            isEnabled = SMAppService.mainApp.status == .enabled
-        } else {
-            isEnabled = false
-        }
+        refresh()
     }
-    
-    private func enableLaunchAtLogin() {
-        if #available(macOS 13.0, *) {
-            do {
+
+    func setEnabled(_ enabled: Bool) {
+        do {
+            if enabled {
                 try SMAppService.mainApp.register()
-            } catch {
-                print("Failed to enable launch at login: \(error)")
-                // Revert the toggle if registration fails
-                DispatchQueue.main.async {
-                    self.isEnabled = false
-                }
-            }
-        }
-    }
-    
-    private func disableLaunchAtLogin() {
-        if #available(macOS 13.0, *) {
-            do {
+            } else {
                 try SMAppService.mainApp.unregister()
-            } catch {
-                print("Failed to disable launch at login: \(error)")
             }
+        } catch {
+            NSLog("AudioPriorityBar: failed to \(enabled ? "enable" : "disable") launch at login: \(error.localizedDescription)")
         }
+        refresh()
     }
-    
+
+    /// Re-reads the real status; the user can change it in System Settings at any time.
     func refresh() {
-        if #available(macOS 13.0, *) {
-            let newStatus = SMAppService.mainApp.status == .enabled
-            if newStatus != isEnabled {
-                // Update without triggering didSet
-                _isEnabled = Published(wrappedValue: newStatus)
-            }
-        }
+        let status = SMAppService.mainApp.status
+        isEnabled = status == .enabled
+        requiresApproval = status == .requiresApproval
+    }
+
+    func openLoginItemsSettings() {
+        SMAppService.openSystemSettingsLoginItems()
     }
 }
-
