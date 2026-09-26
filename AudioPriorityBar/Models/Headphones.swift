@@ -73,6 +73,14 @@ struct HeadphoneDetection {
         "plantronics",
         "voyager",
         "blackwire",
+        "savi",
+        "bt700",
+        "encorepro",
+        "marshall major",
+        "marshall minor",
+        "marshall mid",
+        "marshall motif",
+        "marshall monitor",
         "razer",
         "steelseries",
         "arctis",
@@ -100,20 +108,51 @@ struct HeadphoneDetection {
         "beolit",
         "hdmi",
         "tv",
+        "4k",
+        "soundcore motion",
+        "soundcore boom",
+        "soundcore flare",
+        "ue boom",
+        "megaboom",
+        "wonderboom",
+        "uboom",
+        "nommo",
+        "leviathan",
+        "steelseries arena",
+        "calisto",
+        "panacast",
+        "beoplay a",
+        "beoplay p2",
+        "beoplay p6",
+        "beoplay m",
+    ]
+
+    /// Headphones whose names trip a speaker exclusion ("TV" in TV listening headsets,
+    /// "monitor" style names). Checked before the exclusions.
+    static let headphoneOverrides: [String] = [
+        "tv ears",
+        "tv clear",
+        "marshall monitor",
     ]
 
     /// Check if a device name matches headphone patterns
     static func isHeadphone(deviceName: String) -> Bool {
+        let nameLower = deviceName.lowercased()
+        if headphoneOverrides.contains(where: { containsWord(nameLower, prefix: $0) }) {
+            return true
+        }
         if isSpeakerName(deviceName) {
             return false
         }
-        let nameLower = deviceName.lowercased()
         return keywords.contains { containsWord(nameLower, prefix: $0) }
     }
 
     /// Names that identify a speaker, speakerphone, or display even if other signals say headphones.
     static func isSpeakerName(_ deviceName: String) -> Bool {
         let nameLower = deviceName.lowercased()
+        if headphoneOverrides.contains(where: { containsWord(nameLower, prefix: $0) }) {
+            return false
+        }
         return speakerKeywords.contains { containsWord(nameLower, prefix: $0) }
     }
 

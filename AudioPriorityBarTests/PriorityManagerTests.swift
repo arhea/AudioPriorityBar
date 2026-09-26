@@ -177,4 +177,98 @@ final class PriorityManagerTests: XCTestCase {
         manager.setCategory(.speaker, for: Fixture.airPodsMax)
         XCTAssertEqual(manager.getCategory(for: Fixture.airPodsMax), .speaker)
     }
+
+    // MARK: Review findings
+
+    /// A USB headset's mic and output share one UID; never-using the mic must not hide the output.
+    func testNeverUseIsPerDirection() {
+        let (manager, _) = makePriorityManager()
+        let mic = input("H", "Logitech USB Headset")
+        let speaker = output("H", "Logitech USB Headset")
+
+        manager.setNeverUse(mic, neverUse: true)
+
+        XCTAssertTrue(manager.isNeverUse(mic))
+        XCTAssertFalse(manager.isNeverUse(speaker))
+    }
+
+    func testNeverUseFromOlderBuildsAppliesToBothDirections() {
+        let (_, defaults) = makePriorityManager("never-legacy")
+        defaults.set(["H"], forKey: "neverUseDevices")
+        let manager = PriorityManager(defaults: defaults, legacyDefaults: nil)
+        XCTAssertTrue(manager.isNeverUse(input("H", "Headset")))
+        XCTAssertTrue(manager.isNeverUse(output("H", "Headset")))
+    }
+
+    func testOldDeviceClaimedByTwoNewDevicesIsNotMigrated() {
+        let (manager, defaults) = makePriorityManager()
+        let oldIn = input("A", "USB Audio"), oldOut = output("A", "USB Audio")
+        manager.rememberDevices([oldIn, oldOut])
+        manager.savePriorities([oldOut], category: .speaker)
+
+        manager.migrateReconnectedDevices([input("MIC", "USB Audio"), output("DAC", "USB Audio")])
+
+        XCTAssertEqual(defaults.stringArray(forKey: "speakerPriorities"), ["A"], "ambiguous: two different devices claim A")
+    }
+
+    func testMigrationRequiresMatchingModelWhenKnown() {
+        let (manager, defaults) = makePriorityManager()
+        let old = AudioDevice(id: 1, uid: "old", name: "USB PnP Sound Device", type: .output, transport: .usb, modelUID: "C-Media A")
+        manager.rememberDevices([old])
+        manager.savePriorities([old], category: .speaker)
+
+        let other = AudioDevice(id: 2, uid: "new", name: "USB PnP Sound Device", type: .output, transport: .usb, modelUID: "Generic B")
+        manager.migrateReconnectedDevices([other])
+
+        XCTAssertEqual(defaults.stringArray(forKey: "speakerPriorities"), ["old"])
+    }
+
+    func testMigrationDoesNotDuplicateKnownRecords() {
+        let (manager, _) = makePriorityManager()
+        // X's output is already known; only X's input is new and matches A's input.
+        manager.rememberDevices([input("A", "Dock Audio"), output("A", "Dock Audio"), output("X", "Dock Audio")])
+        manager.migrateReconnectedDevices([input("X", "Dock Audio"), output("X", "Dock Audio")])
+
+        let keys = manager.getKnownDevices().map { "\($0.isInput):\($0.uid)" }
+        XCTAssertEqual(keys.count, Set(keys).count, "no duplicate records")
+    }
+
+    func testOneUnreadableRecordDoesNotWipeKnownDevices() {
+        let (manager, defaults) = makePriorityManager()
+        let json = #"[{"uid":"a","name":"A","isInput":false,"lastSeen":0,"transport":"usb"},{"uid":"b","name":"B","isInput":false,"lastSeen":0,"transport":"hologram"}]"#
+        defaults.set(Data(json.utf8), forKey: "knownDevices")
+
+        let known = manager.getKnownDevices()
+
+        XCTAssertEqual(known.map(\.uid), ["a", "b"], "unknown transport decodes as unknown instead of dropping everything")
+        XCTAssertNil(known[1].transport)
+    }
+
+    func testForgetClearsThatDirectionsSettings() {
+        let (manager, defaults) = makePriorityManager()
+        let old = output("old", "Old Speaker")
+        manager.rememberDevices([old])
+        manager.savePriorities([old], category: .speaker)
+        manager.hideDevice(old, inCategory: .speaker)
+        manager.setNeverUse(old, neverUse: true)
+
+        manager.forgetDevice(old)
+
+        XCTAssertEqual(defaults.stringArray(forKey: "speakerPriorities") ?? [], [])
+        XCTAssertFalse(manager.isHidden(old, inCategory: .speaker))
+        XCTAssertFalse(manager.isNeverUse(old))
+    }
+
+    func testDisconnectStampsLastSeen() {
+        let (manager, _) = makePriorityManager()
+        let device = output("d", "Dock")
+        manager.rememberDevices([device])
+        var records = manager.getKnownDevices()
+        records[0].lastSeen = Date(timeIntervalSinceNow: -5 * 3600)
+        manager.saveKnownDevices(records)
+
+        manager.markSeen([device])
+
+        XCTAssertLessThan(Date().timeIntervalSince(manager.getKnownDevices()[0].lastSeen), 5)
+    }
 }

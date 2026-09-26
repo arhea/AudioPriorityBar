@@ -35,6 +35,34 @@ struct StoredDevice: Codable, Equatable {
     }
 }
 
+extension StoredDevice {
+    private enum CodingKeys: String, CodingKey {
+        case uid, name, isInput, lastSeen, transport, modelUID, isHeadphoneTerminal
+    }
+
+    /// Tolerant of fields this build doesn't understand (e.g. a transport added by a newer
+    /// build), so one odd record can't make the whole list unreadable.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        uid = try container.decode(String.self, forKey: .uid)
+        name = try container.decode(String.self, forKey: .name)
+        isInput = try container.decode(Bool.self, forKey: .isInput)
+        lastSeen = try container.decode(Date.self, forKey: .lastSeen)
+        transport = (try? container.decodeIfPresent(String.self, forKey: .transport)).flatMap { $0.flatMap(AudioTransport.init(rawValue:)) }
+        modelUID = try? container.decodeIfPresent(String.self, forKey: .modelUID)
+        isHeadphoneTerminal = try? container.decodeIfPresent(Bool.self, forKey: .isHeadphoneTerminal)
+    }
+}
+
+/// Decodes to nil instead of failing, so arrays can skip unreadable elements.
+private struct Lossy<Value: Decodable>: Decodable {
+    let value: Value?
+
+    init(from decoder: Decoder) throws {
+        value = try? Value(from: decoder)
+    }
+}
+
 class PriorityManager {
     private let defaults: UserDefaults
 
@@ -60,6 +88,7 @@ class PriorityManager {
     init(defaults: UserDefaults = .standard, legacyDefaults: UserDefaults? = UserDefaults(suiteName: PriorityManager.legacyDomain)) {
         self.defaults = defaults
         importLegacySettingsIfNeeded(from: legacyDefaults)
+        upgradeNeverUseEntries()
     }
 
     // MARK: - Legacy settings
@@ -85,11 +114,17 @@ class PriorityManager {
 
     // MARK: - Known Devices (Persistent Memory)
 
+    /// Decoded once and kept in sync by `saveKnownDevices`; rows read it on every render.
+    private var knownDevicesCache: [StoredDevice]?
+
     func getKnownDevices() -> [StoredDevice] {
+        if let knownDevicesCache { return knownDevicesCache }
         guard let data = defaults.data(forKey: knownDevicesKey),
-              let devices = try? JSONDecoder().decode([StoredDevice].self, from: data) else {
+              let records = try? JSONDecoder().decode([Lossy<StoredDevice>].self, from: data) else {
             return []
         }
+        let devices = records.compactMap(\.value)
+        knownDevicesCache = devices
         return devices
     }
 
@@ -127,14 +162,48 @@ class PriorityManager {
         getKnownDevices().first { $0.uid == uid && $0.isInput == isInput }
     }
 
+    /// Forgets one direction of a device, including its priority and ignore settings, so it
+    /// comes back as new if it's ever plugged in again.
     func forgetDevice(_ device: AudioDevice) {
         let isInput = device.type == .input
         var known = getKnownDevices()
         known.removeAll { $0.uid == device.uid && $0.isInput == isInput }
         saveKnownDevices(known)
+
+        let listKeys = isInput
+            ? [inputPrioritiesKey, hiddenMicsKey]
+            : [speakerPrioritiesKey, headphonePrioritiesKey, hiddenSpeakersKey, hiddenHeadphonesKey]
+        for key in listKeys {
+            if var list = defaults.stringArray(forKey: key), list.contains(device.uid) {
+                list.removeAll { $0 == device.uid }
+                defaults.set(list, forKey: key)
+            }
+        }
+        setNeverUse(device, neverUse: false)
+        if !isInput {
+            var categories = defaults.dictionary(forKey: deviceCategoriesKey) as? [String: String] ?? [:]
+            if categories.removeValue(forKey: device.uid) != nil {
+                defaults.set(categories, forKey: deviceCategoriesKey)
+            }
+        }
     }
 
-    private func saveKnownDevices(_ devices: [StoredDevice]) {
+    /// Records that `devices` were present just now, e.g. at the moment they disconnect.
+    func markSeen(_ devices: [AudioDevice]) {
+        let keys = Set(devices.map(\.listID))
+        guard !keys.isEmpty else { return }
+        let now = Date()
+        let known = getKnownDevices().map { stored -> StoredDevice in
+            guard keys.contains("\(stored.isInput ? "input" : "output"):\(stored.uid)") else { return stored }
+            var updated = stored
+            updated.lastSeen = now
+            return updated
+        }
+        saveKnownDevices(known)
+    }
+
+    func saveKnownDevices(_ devices: [StoredDevice]) {
+        knownDevicesCache = devices
         if let data = try? JSONEncoder().encode(devices) {
             defaults.set(data, forKey: knownDevicesKey)
         }
@@ -154,30 +223,32 @@ class PriorityManager {
         let connectedUIDs = Set(connected.map(\.uid))
         let unknownDevices = connected.filter { !knownKeys.contains("\($0.type == .input):\($0.uid)") }
 
-        var migrated: [String: String] = [:]
+        // Collect every old-to-new claim first; only one-to-one pairs are safe to migrate.
+        var newUIDsByOld: [String: Set<String>] = [:]
+        var oldUIDsByNew: [String: Set<String>] = [:]
         // Bluetooth UIDs are the device's MAC address and never change.
         for device in unknownDevices where device.transport != .bluetooth {
             let isInput = device.type == .input
             // Two new devices sharing a name (e.g. identical mics) is ambiguous; leave them alone.
             let sameNameNewDevices = unknownDevices.filter { $0.name == device.name && $0.type == device.type }
-            // Transport must match too, so a different generic "USB Audio Device" plugged into a
-            // dock can't inherit another one's settings. Records from older builds have no transport.
+            // Transport and, when both are known, model must match too, so a different generic
+            // "USB Audio Device" can't inherit another one's settings. Older records lack both.
             let candidates = known.filter {
                 $0.name == device.name && $0.isInput == isInput && !connectedUIDs.contains($0.uid)
                     && ($0.transport == nil || $0.transport == device.transport)
+                    && ($0.modelUID == nil || device.modelUID == nil || $0.modelUID == device.modelUID)
             }
             guard sameNameNewDevices.count == 1, candidates.count == 1 else { continue }
-
-            let oldUID = candidates[0].uid
-            if let existing = migrated[oldUID] {
-                // The other half of the same physical device already moved; it must agree.
-                if existing != device.uid { continue }
-            } else {
-                migrated[oldUID] = device.uid
-            }
+            newUIDsByOld[candidates[0].uid, default: []].insert(device.uid)
+            oldUIDsByNew[device.uid, default: []].insert(candidates[0].uid)
         }
 
-        for (oldUID, newUID) in migrated {
+        let migrations = newUIDsByOld.compactMap { oldUID, newUIDs -> (String, String)? in
+            guard newUIDs.count == 1, let newUID = newUIDs.first, oldUIDsByNew[newUID]?.count == 1 else { return nil }
+            return (oldUID, newUID)
+        }.sorted { $0.0 < $1.0 }
+
+        for (oldUID, newUID) in migrations {
             replaceUID(oldUID, with: newUID)
         }
     }
@@ -187,7 +258,7 @@ class PriorityManager {
             inputPrioritiesKey, speakerPrioritiesKey, headphonePrioritiesKey,
             neverUseKey, hiddenMicsKey, hiddenSpeakersKey, hiddenHeadphonesKey,
         ]
-        for key in listKeys {
+        for key in listKeys where key != neverUseKey {
             guard var list = defaults.stringArray(forKey: key), list.contains(oldUID) else { continue }
             if list.contains(newUID) {
                 list.removeAll { $0 == oldUID }
@@ -205,9 +276,21 @@ class PriorityManager {
             defaults.set(categories, forKey: deviceCategoriesKey)
         }
 
-        var known = getKnownDevices()
-        known = known.map { stored in
+        if var neverUse = defaults.stringArray(forKey: neverUseKey) {
+            for direction in ["input", "output"] where neverUse.contains("\(direction):\(oldUID)") {
+                neverUse.removeAll { $0 == "\(direction):\(oldUID)" }
+                if !neverUse.contains("\(direction):\(newUID)") {
+                    neverUse.append("\(direction):\(newUID)")
+                }
+            }
+            defaults.set(neverUse, forKey: neverUseKey)
+        }
+
+        // Rename the old records, dropping any whose direction the new UID already has.
+        let existing = Set(getKnownDevices().filter { $0.uid == newUID }.map(\.isInput))
+        let known = getKnownDevices().compactMap { stored -> StoredDevice? in
             guard stored.uid == oldUID else { return stored }
+            guard !existing.contains(stored.isInput) else { return nil }
             return StoredDevice(uid: newUID, name: stored.name, isInput: stored.isInput, lastSeen: stored.lastSeen, transport: stored.transport,
                                 modelUID: stored.modelUID, isHeadphoneTerminal: stored.isHeadphoneTerminal)
         }
@@ -259,21 +342,37 @@ class PriorityManager {
 
     // MARK: - Never Use Devices (never auto-selected)
 
+    /// Entries are per direction ("input:UID" / "output:UID"): a USB headset's mic and output
+    /// share one UID, and never-using the mic mustn't hide the headphones.
     func isNeverUse(_ device: AudioDevice) -> Bool {
         let list = defaults.stringArray(forKey: neverUseKey) ?? []
-        return list.contains(device.uid)
+        return list.contains(device.listID)
     }
 
     func setNeverUse(_ device: AudioDevice, neverUse: Bool) {
         var list = defaults.stringArray(forKey: neverUseKey) ?? []
         if neverUse {
-            if !list.contains(device.uid) {
-                list.append(device.uid)
+            if !list.contains(device.listID) {
+                list.append(device.listID)
             }
         } else {
-            list.removeAll { $0 == device.uid }
+            list.removeAll { $0 == device.listID }
         }
         defaults.set(list, forKey: neverUseKey)
+    }
+
+    /// Older builds stored bare UIDs, which meant both directions; keep that meaning.
+    private func upgradeNeverUseEntries() {
+        guard let list = defaults.stringArray(forKey: neverUseKey),
+              list.contains(where: { !$0.hasPrefix("input:") && !$0.hasPrefix("output:") }) else { return }
+        var upgraded: [String] = []
+        for entry in list {
+            let expanded = entry.hasPrefix("input:") || entry.hasPrefix("output:") ? [entry] : ["input:\(entry)", "output:\(entry)"]
+            for value in expanded where !upgraded.contains(value) {
+                upgraded.append(value)
+            }
+        }
+        defaults.set(upgraded, forKey: neverUseKey)
     }
 
     // MARK: - Hidden Devices (per category)

@@ -105,4 +105,27 @@ final class DeviceDetectionTests: XCTestCase {
         XCTAssertEqual(AudioTransport(coreAudioValue: kAudioDeviceTransportTypeAggregate), .virtual)
         XCTAssertEqual(AudioTransport(coreAudioValue: 0), .other)
     }
+
+    // MARK: Review findings
+
+    func testCommonSpeakersAreNotHeadphones() {
+        let speakers = [
+            "Soundcore Motion+", "Soundcore Boom 2", "Soundcore Flare 2", "Razer Nommo V2", "Razer Leviathan V2",
+            "SteelSeries Arena 7", "Beoplay A1 2nd Gen", "Beoplay P6", "Plantronics Calisto 3200",
+            "Jabra PanaCast 50", "EarFun UBOOM L", "Full HD 4K Monitor",
+        ]
+        for name in speakers {
+            XCTAssertFalse(HeadphoneDetection.isHeadphone(deviceName: name), name)
+        }
+    }
+
+    func testHeadsetsDroppedByTheOldListAreHeadphones() {
+        let headphones = [
+            "Poly Savi 7320", "Poly BT700", "Poly EncorePro 515", "Marshall Major IV", "Marshall Monitor II",
+            "Sennheiser TV Clear", "TV Ears", "Soundcore Life Q30", "Razer BlackShark V2", "Beoplay H95",
+        ]
+        for name in headphones {
+            XCTAssertTrue(HeadphoneDetection.isHeadphone(deviceName: name), name)
+        }
+    }
 }

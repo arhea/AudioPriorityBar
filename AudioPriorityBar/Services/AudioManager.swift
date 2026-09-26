@@ -733,6 +733,7 @@ class AudioManager: ObservableObject {
             return
         }
 
+        priorityManager.markSeen(disconnected)
         let cause = ChangeCause.devicesChanged(connected: connected, disconnected: disconnected)
         retryAttempts = 0
         lastDeviceListChange = Date()
