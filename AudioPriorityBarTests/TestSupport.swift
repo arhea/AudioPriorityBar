@@ -21,6 +21,9 @@ final class FakeAudioDeviceService: AudioDeviceControlling {
     var callModeIds: Set<AudioObjectID> = []
     /// The next N calls to `setDefaultDevice` fail, like a Bluetooth device that isn't ready.
     var failingSets = 0
+    /// Devices that always refuse to become the default.
+    var refusedIds: Set<AudioObjectID> = []
+    private(set) var failedSetCount = 0
     private(set) var setCalls: [(id: AudioObjectID, type: AudioDeviceType)] = []
 
     init(devices: [AudioDevice], output: AudioObjectID?, input: AudioObjectID?) {
@@ -38,8 +41,9 @@ final class FakeAudioDeviceService: AudioDeviceControlling {
 
     @discardableResult
     func setDefaultDevice(_ deviceId: AudioObjectID, type: AudioDeviceType) -> Bool {
-        if failingSets > 0 {
-            failingSets -= 1
+        if failingSets > 0 || refusedIds.contains(deviceId) {
+            failingSets = max(0, failingSets - 1)
+            failedSetCount += 1
             return false
         }
         setCalls.append((deviceId, type))
@@ -85,6 +89,11 @@ final class FakeAudioDeviceService: AudioDeviceControlling {
                 setDefault(fallback.id, type: type)
             }
         }
+    }
+
+    /// A device-list event with no visible change, e.g. a call app creating a hidden aggregate.
+    func publishHiddenDeviceChange() {
+        onDeviceListChanged?()
     }
 
     /// The user picks a device in Control Center or System Settings.

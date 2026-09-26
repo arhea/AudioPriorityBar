@@ -315,6 +315,85 @@ final class AudioManagerTests: XCTestCase {
         await waitUntil { manager.currentOutputId == Fixture.studioDisplay.id }
     }
 
+    // MARK: Review findings
+
+    func testDeviceThatAlwaysRefusesFallsBackToNextPriorityAndStopsRetrying() async {
+        priorities.savePriorities([Fixture.studioDisplay, Fixture.airPodsMax, Fixture.speakers], category: .speaker)
+        priorities.setCategory(.speaker, for: Fixture.airPodsMax)
+        let manager = makeManager(devices: [Fixture.speakers, Fixture.builtInMic], output: Fixture.speakers, input: Fixture.builtInMic)
+        service.refusedIds = [Fixture.studioDisplay.id]
+
+        service.connect(Fixture.studioDisplay, Fixture.airPodsMax)
+
+        await waitUntil { manager.currentOutputId == Fixture.airPodsMax.id }
+        await settle(0.6)
+        let attempts = service.failedSetCount
+        await settle(0.6)
+        XCTAssertEqual(service.failedSetCount, attempts, "retries must stop")
+        XCTAssertLessThanOrEqual(attempts, 8)
+    }
+
+    func testRetryAfterPopoverActionDoesNotNotify() async {
+        let manager = makeManager(devices: [Fixture.speakers, Fixture.builtInMic], output: Fixture.speakers, input: Fixture.builtInMic)
+        service.connect(Fixture.studioDisplay)
+        await settle()
+        let before = notifier.changes.count
+        service.failingSets = 1
+
+        manager.moveDevice(in: .speakers, from: manager.speakerDevices.firstIndex(of: Fixture.studioDisplay)!, to: 0)
+
+        await waitUntil { manager.currentOutputId == Fixture.studioDisplay.id }
+        await settle()
+        XCTAssertEqual(notifier.changes.count, before, "a retried popover action isn't announced with an old reason")
+    }
+
+    func testEventWithNoVisibleChangeKeepsUserPick() async {
+        priorities.savePriorities([Fixture.studioDisplay, Fixture.speakers], category: .speaker)
+        let manager = makeManager(devices: [Fixture.speakers, Fixture.studioDisplay, Fixture.builtInMic],
+                                  output: Fixture.studioDisplay, input: Fixture.builtInMic, gracePeriod: 0.05)
+        await settle(0.1)
+        service.userPicks(Fixture.speakers)
+        await waitUntil { manager.currentOutputId == Fixture.speakers.id }
+        let before = notifier.changes.count
+
+        service.publishHiddenDeviceChange()
+        await settle()
+
+        XCTAssertEqual(service.defaultOutput, Fixture.speakers.id, "a hidden aggregate appearing isn't a reason to revert")
+        XCTAssertEqual(notifier.changes.count, before)
+    }
+
+    func testLaunchInHeadphoneModeWithoutHeadphonesUsesSpeakers() {
+        priorities.currentMode = .headphone
+        priorities.savePriorities([Fixture.speakers, Fixture.studioDisplay], category: .speaker)
+        let manager = makeManager(devices: [Fixture.speakers, Fixture.studioDisplay, Fixture.builtInMic],
+                                  output: Fixture.studioDisplay, input: Fixture.builtInMic)
+        XCTAssertEqual(manager.currentMode, .speaker)
+        XCTAssertEqual(manager.currentOutputId, Fixture.speakers.id)
+    }
+
+    func testUseNowRightAfterConnectSticks() async {
+        let manager = makeManager(devices: [Fixture.speakers, Fixture.builtInMic], output: Fixture.speakers, input: Fixture.builtInMic,
+                                  gracePeriod: 0.5)
+        service.connect(Fixture.airPodsMax, macOSSwitchesTo: Fixture.airPodsMax)
+        await waitUntil { manager.currentOutputId == Fixture.airPodsMax.id }
+
+        manager.useDevice(Fixture.speakers)
+        await settle(0.3)
+
+        XCTAssertEqual(service.defaultOutput, Fixture.speakers.id, "an explicit pick inside the grace window sticks")
+    }
+
+    func testClickingSkippedBluetoothMicUsesIt() {
+        priorities.savePriorities([Fixture.builtInMic, Fixture.airPodsMaxMic], type: .input)
+        let manager = makeManager(devices: [Fixture.airPodsMax, Fixture.airPodsMaxMic, Fixture.builtInMic],
+                                  output: Fixture.airPodsMax, input: Fixture.builtInMic)
+
+        manager.activate(Fixture.airPodsMaxMic, in: .microphones)
+
+        XCTAssertEqual(manager.currentInputId, Fixture.airPodsMaxMic.id, "clicking a device always switches to it")
+    }
+
     // MARK: Volume, mute, battery
 
     func testUnmutingAtZeroVolumeRestoresVolume() {

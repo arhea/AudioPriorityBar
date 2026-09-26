@@ -36,6 +36,10 @@ class AudioManager: ObservableObject {
     private let log = Logger(subsystem: "app.audioprioritybar", category: "switching")
     private var lowBatteryNotified: Set<String> = []
     private var pendingRetry: Task<Void, Never>?
+    private var retryAttempts = 0
+    private let maxRetryAttempts = 3
+    /// Low-battery warnings wait until launch finishes, when notifications are authorized.
+    private var hasFinishedLaunching = false
     private var lastOutputChange: Date = .distantPast
     private let notifications: DeviceChangeNotifying?
 
@@ -103,10 +107,13 @@ class AudioManager: ObservableObject {
         previousConnectedDevices = connectedDevices
         setupListeners()
         if !isCustomMode {
-            applyHighestPriorityInput()
-            applyHighestPriorityOutput()
+            // Headphones may have gone away while the app wasn't running.
+            autoSwitchModeIfNeeded(newlyConnected: [])
+            applyHighestPriorityInput(cause: .startup)
+            applyHighestPriorityOutput(cause: .startup)
         }
         syncCurrentDevices(cause: .startup)
+        hasFinishedLaunching = true
     }
 
     // MARK: - Derived state
@@ -179,7 +186,7 @@ class AudioManager: ObservableObject {
         keepsBluetoothHighQuality = enabled
         priorityManager.keepsBluetoothHighQuality = enabled
         if !isCustomMode {
-            applyHighestPriorityInput()
+            applyHighestPriorityInput(cause: .userAction)
         }
         syncCurrentDevices(cause: .userAction)
     }
@@ -209,7 +216,7 @@ class AudioManager: ObservableObject {
         for (key, battery) in result where !battery.isLow {
             lowBatteryNotified.remove(key)
         }
-        if let output = currentOutputDevice, let battery = result[output.listID], battery.isLow,
+        if hasFinishedLaunching, let output = currentOutputDevice, let battery = result[output.listID], battery.isLow,
            !lowBatteryNotified.contains(output.listID) {
             lowBatteryNotified.insert(output.listID)
             notifications?.postLowBattery(device: output, battery: battery)
@@ -345,7 +352,7 @@ class AudioManager: ObservableObject {
         currentMode = mode
         priorityManager.currentMode = mode
         if !isCustomMode {
-            applyHighestPriorityOutput()
+            applyHighestPriorityOutput(cause: .userAction)
         }
         syncCurrentDevices(cause: .userAction)
     }
@@ -354,8 +361,8 @@ class AudioManager: ObservableObject {
         isCustomMode = enabled
         priorityManager.isCustomMode = enabled
         if !enabled {
-            applyHighestPriorityInput()
-            applyHighestPriorityOutput()
+            applyHighestPriorityInput(cause: .userAction)
+            applyHighestPriorityOutput(cause: .userAction)
         }
         syncCurrentDevices(cause: .userAction)
     }
@@ -366,8 +373,8 @@ class AudioManager: ObservableObject {
         priorityManager.currentMode = mode
         isCustomMode = false
         priorityManager.isCustomMode = false
-        applyHighestPriorityInput()
-        applyHighestPriorityOutput()
+        applyHighestPriorityInput(cause: .userAction)
+        applyHighestPriorityOutput(cause: .userAction)
         syncCurrentDevices(cause: .userAction)
     }
 
@@ -415,6 +422,11 @@ class AudioManager: ObservableObject {
             return
         }
         moveDevice(in: section, from: index, to: 0)
+        // Auto-selection can pass over the new #1 (a Bluetooth mic kept for quality, an ignored
+        // device under All Devices). A click still means "use this".
+        if currentDeviceId(for: section) != device.id {
+            useDevice(device)
+        }
     }
 
     // MARK: - Categories, ignoring, never-use
@@ -486,9 +498,9 @@ class AudioManager: ObservableObject {
     private func reapplyAfterUserChange(type: AudioDeviceType) {
         if !isCustomMode {
             if type == .input {
-                applyHighestPriorityInput()
+                applyHighestPriorityInput(cause: .userAction)
             } else {
-                applyHighestPriorityOutput()
+                applyHighestPriorityOutput(cause: .userAction)
             }
         }
         syncCurrentDevices(cause: .userAction)
@@ -500,7 +512,7 @@ class AudioManager: ObservableObject {
         inputDevices.move(fromOffsets: source, toOffset: destination)
         priorityManager.savePriorities(inputDevices, type: .input)
         if !isCustomMode {
-            applyHighestPriorityInput()
+            applyHighestPriorityInput(cause: .userAction)
         }
         syncCurrentDevices(cause: .userAction)
     }
@@ -509,7 +521,7 @@ class AudioManager: ObservableObject {
         speakerDevices.move(fromOffsets: source, toOffset: destination)
         priorityManager.savePriorities(speakerDevices, category: .speaker)
         if !isCustomMode && currentMode == .speaker {
-            applyHighestPriorityOutput()
+            applyHighestPriorityOutput(cause: .userAction)
         }
         syncCurrentDevices(cause: .userAction)
     }
@@ -518,7 +530,7 @@ class AudioManager: ObservableObject {
         headphoneDevices.move(fromOffsets: source, toOffset: destination)
         priorityManager.savePriorities(headphoneDevices, category: .headphone)
         if !isCustomMode && currentMode == .headphone {
-            applyHighestPriorityOutput()
+            applyHighestPriorityOutput(cause: .userAction)
         }
         syncCurrentDevices(cause: .userAction)
     }
@@ -526,37 +538,39 @@ class AudioManager: ObservableObject {
     // MARK: - Selecting devices
 
     func setInputDevice(_ device: AudioDevice) {
-        applyInputDevice(device)
-        syncCurrentDevices(cause: .userAction)
+        userPicked(device)
     }
 
     func setOutputDevice(_ device: AudioDevice) {
-        applyOutputDevice(device)
+        userPicked(device)
+    }
+
+    /// An explicit choice from the popover. It ends any connection grace window, so the echo
+    /// of this switch isn't mistaken for macOS and reverted.
+    private func userPicked(_ device: AudioDevice) {
+        lastDeviceListChange = .distantPast
+        retryAttempts = 0
+        applyDevice(device)
         syncCurrentDevices(cause: .userAction)
     }
 
-    private func applyInputDevice(_ device: AudioDevice) {
+    /// Makes `device` the default. Returns whether it is the default afterwards.
+    @discardableResult
+    private func applyDevice(_ device: AudioDevice) -> Bool {
+        guard device.isConnected, let deviceService else { return false }
         // Skipping no-op writes avoids a listener feedback loop during the grace period.
-        guard device.isConnected, deviceService?.getCurrentDefaultDevice(type: .input) != device.id else { return }
-        if deviceService?.setDefaultDevice(device.id, type: .input) == true {
-            log.notice("Input -> \(device.name, privacy: .public)")
+        if deviceService.getCurrentDefaultDevice(type: device.type) == device.id { return true }
+        guard deviceService.setDefaultDevice(device.id, type: device.type) else {
+            log.error("\(device.name, privacy: .public) refused to become the default \(device.type.rawValue, privacy: .public)")
+            return false
+        }
+        log.notice("\(device.type == .input ? "Input" : "Output") -> \(device.name, privacy: .public)")
+        if device.type == .input {
             currentInputId = device.id
         } else {
-            log.error("Couldn't set input to \(device.name, privacy: .public); retrying")
-            scheduleRetry()
-        }
-    }
-
-    private func applyOutputDevice(_ device: AudioDevice) {
-        // Skipping no-op writes avoids a listener feedback loop during the grace period.
-        guard device.isConnected, deviceService?.getCurrentDefaultDevice(type: .output) != device.id else { return }
-        if deviceService?.setDefaultDevice(device.id, type: .output) == true {
-            log.notice("Output -> \(device.name, privacy: .public)")
             currentOutputId = device.id
-        } else {
-            log.error("Couldn't set output to \(device.name, privacy: .public); retrying")
-            scheduleRetry()
         }
+        return true
     }
 
     /// Connected devices eligible for auto-selection, best first. Built from CoreAudio rather
@@ -579,30 +593,41 @@ class AudioManager: ObservableObject {
         return priorityManager.sortByPriority(outputs, category: category)
     }
 
-    private func applyHighestPriorityInput() {
-        if let first = autoSelectionCandidates(input: true).first {
-            applyInputDevice(first)
+    private func applyHighestPriorityInput(cause: ChangeCause) {
+        applyFirstAccepted(autoSelectionCandidates(input: true), cause: cause)
+    }
+
+    private func applyHighestPriorityOutput(cause: ChangeCause) {
+        applyFirstAccepted(autoSelectionCandidates(input: false), cause: cause)
+    }
+
+    /// Uses the best candidate that accepts. A device that refuses (typically Bluetooth that
+    /// isn't ready yet) falls through to the next one, and gets a few more chances shortly.
+    private func applyFirstAccepted(_ candidates: [AudioDevice], cause: ChangeCause) {
+        for (rank, device) in candidates.enumerated() where applyDevice(device) {
+            if rank > 0 {
+                scheduleRetry(cause: cause)
+            }
+            return
+        }
+        if !candidates.isEmpty {
+            scheduleRetry(cause: cause)
         }
     }
 
-    private func applyHighestPriorityOutput() {
-        if let first = autoSelectionCandidates(input: false).first {
-            applyOutputDevice(first)
-        }
-    }
-
-    /// Bluetooth devices can show up in CoreAudio a moment before they accept being the
-    /// default. Try the priorities once more shortly after a failed switch.
-    private func scheduleRetry() {
-        guard pendingRetry == nil else { return }
+    /// Re-applies priorities a few times after a refusal, announcing the result with the cause
+    /// of the switch that failed rather than whatever happened last.
+    private func scheduleRetry(cause: ChangeCause) {
+        guard pendingRetry == nil, retryAttempts < maxRetryAttempts else { return }
+        retryAttempts += 1
         pendingRetry = Task { @MainActor [weak self, retryDelay] in
             try? await Task.sleep(nanoseconds: UInt64(retryDelay * 1_000_000_000))
             guard let self, !Task.isCancelled else { return }
             self.pendingRetry = nil
             guard !self.isCustomMode else { return }
-            self.applyHighestPriorityInput()
-            self.applyHighestPriorityOutput()
-            self.syncCurrentDevices(cause: self.lastDeviceListCause)
+            self.applyHighestPriorityInput(cause: cause)
+            self.applyHighestPriorityOutput(cause: cause)
+            self.syncCurrentDevices(cause: cause)
         }
     }
 
@@ -614,6 +639,11 @@ class AudioManager: ObservableObject {
         guard let deviceService else { return }
         currentOutputId = deviceService.getCurrentDefaultDevice(type: .output)
         currentInputId = deviceService.getCurrentDefaultDevice(type: .input)
+        // A default we haven't listed yet means the device list is stale; refresh everything
+        // that depends on it before announcing anything.
+        if (currentOutputId != nil && currentOutputDevice == nil) || (currentInputId != nil && currentInputDevice == nil) {
+            refreshDevices()
+        }
         refreshVolume()
         refreshMuteStatus()
         refreshCallMode()
@@ -629,10 +659,6 @@ class AudioManager: ObservableObject {
         }
 
         guard outputChanged || inputChanged else { return }
-        if (outputChanged && currentOutputId != nil && currentOutputDevice == nil)
-            || (inputChanged && currentInputId != nil && currentInputDevice == nil) {
-            connectedDevices = deviceService.getDevices()
-        }
         let changedOutput = outputChanged ? currentOutputDevice : nil
         let changedInput = inputChanged ? currentInputDevice : nil
 
@@ -680,7 +706,6 @@ class AudioManager: ObservableObject {
     }
 
     private func scheduleDeviceListRefresh() {
-        lastDeviceListChange = Date()
         pendingDeviceListRefresh?.cancel()
         pendingDeviceListRefresh = Task { @MainActor [weak self, deviceListDebounce] in
             try? await Task.sleep(nanoseconds: UInt64(deviceListDebounce * 1_000_000_000))
@@ -699,15 +724,25 @@ class AudioManager: ObservableObject {
         let newKeys = Set(connectedDevices.map(\.listID))
         let connected = connectedDevices.filter { !oldKeys.contains($0.listID) }
         let disconnected = oldDevices.filter { !newKeys.contains($0.listID) }
+
+        // Hidden aggregates (call apps, recorders) come and go without changing anything the
+        // app lists. That's no reason to reapply priorities over the user's current choice.
+        guard !connected.isEmpty || !disconnected.isEmpty else {
+            refreshMuteStatus()
+            refreshCallMode()
+            return
+        }
+
         let cause = ChangeCause.devicesChanged(connected: connected, disconnected: disconnected)
+        retryAttempts = 0
         lastDeviceListChange = Date()
         lastDeviceListCause = cause
         log.notice("Devices changed. Connected: \(connected.map(\.name), privacy: .public) Disconnected: \(disconnected.map(\.name), privacy: .public)")
 
         if !isCustomMode {
             autoSwitchModeIfNeeded(newlyConnected: connected)
-            applyHighestPriorityInput()
-            applyHighestPriorityOutput()
+            applyHighestPriorityInput(cause: cause)
+            applyHighestPriorityOutput(cause: cause)
         }
         syncCurrentDevices(cause: cause)
     }
@@ -723,8 +758,8 @@ class AudioManager: ObservableObject {
         let withinGracePeriod = Date().timeIntervalSince(lastDeviceListChange) < connectionGracePeriod
         if withinGracePeriod {
             if !isCustomMode {
-                applyHighestPriorityInput()
-                applyHighestPriorityOutput()
+                applyHighestPriorityInput(cause: lastDeviceListCause)
+                applyHighestPriorityOutput(cause: lastDeviceListCause)
             }
             syncCurrentDevices(cause: lastDeviceListCause)
             return
@@ -743,7 +778,7 @@ class AudioManager: ObservableObject {
            let output = connectedDevices.first(where: { $0.id == newOutputId && $0.type == .output }),
            input.transport == .bluetooth, input.name == output.name {
             log.notice("\(output.name, privacy: .public) took the mic along with the output; restoring the preferred mic")
-            applyHighestPriorityInput()
+            applyHighestPriorityInput(cause: .external)
         }
         log.notice("Default device changed outside the app")
         syncCurrentDevices(cause: .external)
