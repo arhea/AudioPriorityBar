@@ -165,16 +165,20 @@ enum Fixture {
     }
 }
 
+/// Defaults suites for tests, never the real app settings. Names come from a small fixed set
+/// and are wiped when handed out: cfprefsd writes a plist back after any deletion, so unique
+/// per-test names would leave a new file in ~/Library/Preferences on every run.
+func makeTestDefaults(_ name: String = "default") -> UserDefaults {
+    let suite = "AudioPriorityBarTests.\(name)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defaults.removePersistentDomain(forName: suite)
+    return defaults
+}
+
 extension XCTestCase {
-    /// A PriorityManager backed by a throwaway defaults suite, never the real app settings.
-    /// The suite is deleted after the test so runs don't pile up files in ~/Library/Preferences.
-    func makePriorityManager(_ name: String = UUID().uuidString, legacy: UserDefaults? = nil) -> (PriorityManager, UserDefaults) {
-        let suite = "AudioPriorityBarTests.\(name)"
-        let defaults = UserDefaults(suiteName: suite)!
-        defaults.removePersistentDomain(forName: suite)
-        addTeardownBlock {
-            defaults.removePersistentDomain(forName: suite)
-        }
+    /// A PriorityManager on a freshly wiped test suite.
+    func makePriorityManager(_ name: String = "default", legacy: UserDefaults? = nil) -> (PriorityManager, UserDefaults) {
+        let defaults = makeTestDefaults(name)
         return (PriorityManager(defaults: defaults, legacyDefaults: legacy), defaults)
     }
 }

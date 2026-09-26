@@ -145,16 +145,13 @@ final class PriorityManagerTests: XCTestCase {
     // MARK: Settings
 
     func testLegacySettingsImportOnce() throws {
-        let legacySuite = "AudioPriorityBarTests.legacy.\(UUID().uuidString)"
-        let legacy = try XCTUnwrap(UserDefaults(suiteName: legacySuite))
-        defer { legacy.removePersistentDomain(forName: legacySuite) }
+        let legacy = makeTestDefaults("legacy")
         legacy.set(["old1", "old2"], forKey: "speakerPriorities")
         legacy.set(true, forKey: "customMode")
         legacy.set(try JSONEncoder().encode([StoredDevice(uid: "old1", name: "Old", isInput: false, lastSeen: Date())]),
                    forKey: "knownDevices")
 
-        let name = UUID().uuidString
-        let (manager, defaults) = makePriorityManager(name, legacy: legacy)
+        let (manager, defaults) = makePriorityManager("imported", legacy: legacy)
         XCTAssertEqual(defaults.stringArray(forKey: "speakerPriorities"), ["old1", "old2"])
         XCTAssertTrue(manager.isCustomMode)
         XCTAssertEqual(manager.getKnownDevices().first?.uid, "old1")
