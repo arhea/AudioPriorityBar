@@ -19,6 +19,8 @@ concurrency:
 jobs:
   build:
     runs-on: macos-15
+    # Notarization waits on Apple; don't let a stuck submission hold a macOS runner for hours.
+    timeout-minutes: 45
     env:
       # Sign and notarize only when the Developer ID secrets exist, and never for pull requests.
       # Without them (forks, PRs, before enrollment) the build is ad-hoc signed.
@@ -116,17 +118,28 @@ jobs:
           name: AudioPriorityBar
           path: release
 
+      # The release action reuses an existing tag as-is, so move `nightly` to this commit first;
+      # otherwise the tag and source archives stay on the first nightly forever.
+      - name: Move nightly tag
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/nightly" -f sha="$GITHUB_SHA" -F force=true \
+            || gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref=refs/tags/nightly -f sha="$GITHUB_SHA"
+
       - name: Create Nightly Release
         if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           tag_name: nightly
+          target_commitish: ${{ github.sha }}
           name: Nightly Build
           body: |
             Automated nightly build from the latest commit on main. ${{ needs.build.outputs.signed == 'true' && 'Signed with Developer ID and notarized.' || 'Ad-hoc signed, not notarized: right-click the app and choose Open on first launch.' }}
 
             **Commit:** ${{ github.sha }}
-            **Date:** ${{ github.event.head_commit.timestamp }}
+            **Date:** ${{ github.event.head_commit.timestamp || 'manual run' }}
           files: |
             release/AudioPriorityBar.zip
             release/AudioPriorityBar.zip.sha256

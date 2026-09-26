@@ -37,6 +37,7 @@ fi
 
 xcodebuild -scheme AudioPriorityBar \
   -configuration Release \
+  -destination 'generic/platform=macOS' \
   -derivedDataPath .build \
   -arch arm64 -arch x86_64 \
   ONLY_ACTIVE_ARCH=NO \
@@ -57,16 +58,19 @@ if [[ -n "$NOTARY_MODE" ]]; then
   SUBMISSION="dist/AudioPriorityBar-notarize.zip"
   ditto -c -k --keepParent "$APP" "$SUBMISSION"
 
+  # Keep going on a failed submission so the output (and its ID, for `notarytool log`) is shown.
   if [[ "$NOTARY_MODE" == "profile" ]]; then
-    RESULT=$(xcrun notarytool submit "$SUBMISSION" --keychain-profile "$NOTARY_PROFILE" --wait --output-format json)
+    RESULT=$(xcrun notarytool submit "$SUBMISSION" --keychain-profile "$NOTARY_PROFILE" \
+      --wait --timeout 30m --output-format json) || true
   else
     RESULT=$(xcrun notarytool submit "$SUBMISSION" --key "$NOTARY_KEY_PATH" --key-id "$NOTARY_KEY_ID" \
-      --issuer "$NOTARY_ISSUER_ID" --wait --output-format json)
+      --issuer "$NOTARY_ISSUER_ID" --wait --timeout 30m --output-format json) || true
   fi
   rm -f "$SUBMISSION"
   echo "$RESULT"
 
-  if ! grep -q '"status":"Accepted"' <<<"$RESULT"; then
+  STATUS=$(plutil -extract status raw -o - - <<<"$RESULT" 2>/dev/null || true)
+  if [[ "$STATUS" != "Accepted" ]]; then
     echo "error: notarization was not accepted; run \`xcrun notarytool log <id>\` for details" >&2
     exit 1
   fi
