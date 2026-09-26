@@ -48,8 +48,18 @@ struct AudioProduct: Equatable {
         return catalog[ids.product]
     }
 
-    /// First symbol this macOS version has, falling back to generic headphones.
+    /// First symbol this macOS version has, falling back to generic headphones. Resolved once
+    /// per product; rows ask for it on every render.
     var symbolName: String {
+        Self.resolvedSymbols[symbols[0]] ?? Self.resolve(symbols)
+    }
+
+    private static let resolvedSymbols: [String: String] = Dictionary(
+        catalog.values.map { ($0.symbols[0], resolve($0.symbols)) },
+        uniquingKeysWith: { first, _ in first }
+    )
+
+    private static func resolve(_ symbols: [String]) -> String {
         symbols.first { NSImage(systemSymbolName: $0, accessibilityDescription: nil) != nil } ?? "headphones"
     }
 }

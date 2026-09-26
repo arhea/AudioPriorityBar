@@ -34,6 +34,11 @@ class AudioDeviceService: AudioDeviceControlling {
     private var muteVolumeListenerBlock: AudioObjectPropertyListenerBlock?
     private var monitoredDeviceIds: Set<AudioObjectID> = []
     private var isListening = false
+    /// The alert device was following the output but the last output couldn't take it
+    /// (not every device can be the system device). Keep following on the next switch.
+    private var systemOutputPendingFollow = false
+    /// Highest sample rate seen per Bluetooth output outside call mode, for call detection.
+    private var highestRateSeen: [String: Float64] = [:]
 
     private static let systemObject = AudioObjectID(kAudioObjectSystemObject)
 
@@ -74,8 +79,13 @@ class AudioDeviceService: AudioDeviceControlling {
         let systemOutput: AudioObjectID? = getValue(Self.systemObject, kAudioHardwarePropertyDefaultSystemOutputDevice)
         let didSet = setValue(Self.systemObject, kAudioHardwarePropertyDefaultOutputDevice, deviceId)
 
-        if didSet, systemOutput == nil || systemOutput == previousOutput {
-            setValue(Self.systemObject, kAudioHardwarePropertyDefaultSystemOutputDevice, deviceId)
+        let isFollowing = systemOutput == nil || systemOutput == previousOutput || systemOutputPendingFollow
+        if didSet, isFollowing {
+            let canBeSystem: UInt32? = getValue(deviceId, kAudioDevicePropertyDeviceCanBeDefaultSystemDevice,
+                                                scope: kAudioDevicePropertyScopeOutput)
+            let moved = canBeSystem != 0
+                && setValue(Self.systemObject, kAudioHardwarePropertyDefaultSystemOutputDevice, deviceId)
+            systemOutputPendingFollow = !moved
         }
         return didSet
     }
@@ -168,8 +178,11 @@ class AudioDeviceService: AudioDeviceControlling {
         muteVolumeListenerBlock = block
 
         for deviceId in allDeviceIds() {
-            addListener(deviceId, kAudioDevicePropertyMute, block, scope: kAudioDevicePropertyScopeOutput)
-            addListener(deviceId, kAudioDevicePropertyMute, block, scope: kAudioDevicePropertyScopeInput)
+            for scope in [kAudioDevicePropertyScopeOutput, kAudioDevicePropertyScopeInput] {
+                addListener(deviceId, kAudioDevicePropertyMute, block, scope: scope)
+                // Some devices only publish mute on channel 1; isDeviceMuted reads it there.
+                addListener(deviceId, kAudioDevicePropertyMute, block, scope: scope, element: 1)
+            }
             addListener(deviceId, kAudioHardwareServiceDeviceProperty_VirtualMainVolume, block, scope: kAudioDevicePropertyScopeOutput)
             // Bluetooth headphones drop their sample rate when they switch to call mode.
             addListener(deviceId, kAudioDevicePropertyNominalSampleRate, block)
@@ -181,8 +194,10 @@ class AudioDeviceService: AudioDeviceControlling {
         guard let block = muteVolumeListenerBlock else { return }
 
         for deviceId in monitoredDeviceIds {
-            removeListener(deviceId, kAudioDevicePropertyMute, block, scope: kAudioDevicePropertyScopeOutput)
-            removeListener(deviceId, kAudioDevicePropertyMute, block, scope: kAudioDevicePropertyScopeInput)
+            for scope in [kAudioDevicePropertyScopeOutput, kAudioDevicePropertyScopeInput] {
+                removeListener(deviceId, kAudioDevicePropertyMute, block, scope: scope)
+                removeListener(deviceId, kAudioDevicePropertyMute, block, scope: scope, element: 1)
+            }
             removeListener(deviceId, kAudioHardwareServiceDeviceProperty_VirtualMainVolume, block, scope: kAudioDevicePropertyScopeOutput)
             removeListener(deviceId, kAudioDevicePropertyNominalSampleRate, block)
         }
@@ -258,14 +273,19 @@ class AudioDeviceService: AudioDeviceControlling {
         return getValue(first, kAudioStreamPropertyTerminalType)
     }
 
-    /// A Bluetooth output that has dropped to a narrowband rate (≤ 24 kHz) while it supports
-    /// 44.1 kHz or more is in call mode (HFP): an app is using its microphone, and playback
-    /// quality falls until the mic is released.
+    /// A Bluetooth output running below 44.1 kHz when it can play at 44.1 kHz or more is in
+    /// call mode (HFP at 16/24 kHz, LE Audio at 32 kHz): an app is using its microphone, and
+    /// playback quality falls until the mic is released. The best rate seen earlier counts too,
+    /// in case a device narrows its advertised rates while in a call.
     func isInCallMode(_ device: AudioDevice) -> Bool {
         guard device.type == .output, device.transport == .bluetooth, device.isConnected else { return false }
         let nominal: Float64? = getValue(device.id, kAudioDevicePropertyNominalSampleRate)
-        guard let nominal, nominal > 0, nominal <= 24_000 else { return false }
-        return maxAvailableSampleRate(device.id) >= 44_100
+        guard let nominal, nominal > 0 else { return false }
+        if nominal >= 44_100 {
+            highestRateSeen[device.uid] = max(highestRateSeen[device.uid] ?? 0, nominal)
+            return false
+        }
+        return max(maxAvailableSampleRate(device.id), highestRateSeen[device.uid] ?? 0) >= 44_100
     }
 
     private func maxAvailableSampleRate(_ deviceId: AudioObjectID) -> Float64 {
@@ -345,9 +365,11 @@ class AudioDeviceService: AudioDeviceControlling {
         _ objectId: AudioObjectID,
         _ selector: AudioObjectPropertySelector,
         _ block: @escaping AudioObjectPropertyListenerBlock,
-        scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal
+        scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal,
+        element: AudioObjectPropertyElement = kAudioObjectPropertyElementMain
     ) {
-        var address = Self.address(selector, scope: scope)
+        var address = Self.address(selector, scope: scope, element: element)
+        guard element == kAudioObjectPropertyElementMain || AudioObjectHasProperty(objectId, &address) else { return }
         AudioObjectAddPropertyListenerBlock(objectId, &address, DispatchQueue.main, block)
     }
 
@@ -355,9 +377,10 @@ class AudioDeviceService: AudioDeviceControlling {
         _ objectId: AudioObjectID,
         _ selector: AudioObjectPropertySelector,
         _ block: @escaping AudioObjectPropertyListenerBlock,
-        scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal
+        scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal,
+        element: AudioObjectPropertyElement = kAudioObjectPropertyElementMain
     ) {
-        var address = Self.address(selector, scope: scope)
+        var address = Self.address(selector, scope: scope, element: element)
         AudioObjectRemovePropertyListenerBlock(objectId, &address, DispatchQueue.main, block)
     }
 }

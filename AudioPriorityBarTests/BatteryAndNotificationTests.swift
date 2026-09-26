@@ -43,6 +43,20 @@ final class BatteryTests: XCTestCase {
         XCTAssertNil(monitor.battery(for: Fixture.speakers, in: batteries), "only Bluetooth devices have batteries")
     }
 
+    /// IOPS also lists accessories that aren't connected to this Mac. Two sets with the same
+    /// name and model mustn't be merged into one reading.
+    func testTwoSetsWithTheSameNameAreNotMerged() {
+        let monitor = BatteryMonitor(source: { [] })
+        func part(_ group: String, _ side: AccessoryBattery.Part, _ level: Int) -> AccessoryBattery {
+            AccessoryBattery(name: "AirPods Pro", productID: 0x200E, vendorID: 0x4C, part: side, level: level,
+                             isCharging: false, lowWarningLevel: 20, groupID: group)
+        }
+        let batteries = [part("mine", .left, 90), part("mine", .right, 88), part("theirs", .left, 5), part("theirs", .right, 6)]
+
+        XCTAssertNil(monitor.battery(for: Fixture.airPodsPro, in: batteries), "can't tell which set is connected")
+        XCTAssertEqual(monitor.battery(for: Fixture.airPodsPro, in: Array(batteries.prefix(2)))?.listeningLevel, 88)
+    }
+
     func testInjectedSourceIsUsed() {
         let monitor = BatteryMonitor(source: { [Fixture.battery("AirPods Max", .single, 42)] })
         XCTAssertEqual(monitor.accessoryBatteries().map(\.level), [42])

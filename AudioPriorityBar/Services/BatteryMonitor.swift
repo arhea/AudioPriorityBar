@@ -17,6 +17,8 @@ struct AccessoryBattery: Equatable {
     let level: Int
     let isCharging: Bool
     let lowWarningLevel: Int
+    /// Parts of one physical accessory (both AirPods and the case) share a group.
+    var groupID: String? = nil
 }
 
 /// Battery levels for a whole device, e.g. both AirPods and the case.
@@ -83,8 +85,16 @@ final class BatteryMonitor {
         return unsafeBitCast(symbol, to: CopyPowerSourcesByType.self)
     }()
 
+    private typealias CreateRunLoopSource = @convention(c) (IOPowerSourceCallbackType, UnsafeMutableRawPointer?) -> Unmanaged<CFRunLoopSource>?
+    /// The public power-source notification only fires for the Mac's own battery; accessory
+    /// levels change through this one (verified: AirPods Max 70% → 69% fired only here).
+    private static let createAccessoryRunLoopSource: CreateRunLoopSource? = {
+        guard let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "IOPSAccNotificationCreateRunLoopSource") else { return nil }
+        return unsafeBitCast(symbol, to: CreateRunLoopSource.self)
+    }()
+
     var onChange: (() -> Void)?
-    private var runLoopSource: CFRunLoopSource?
+    private var runLoopSources: [CFRunLoopSource] = []
     private let source: (() -> [AccessoryBattery])?
 
     /// `source` replaces the IOKit lookup, for tests.
@@ -116,7 +126,8 @@ final class BatteryMonitor {
                 part: (description["Part Identifier"] as? String).flatMap(AccessoryBattery.Part.init(rawValue:)) ?? .single,
                 level: level,
                 isCharging: (description[kIOPSIsChargingKey] as? Bool) ?? false,
-                lowWarningLevel: (description["Low Warn Level"] as? Int) ?? 20
+                lowWarningLevel: (description["Low Warn Level"] as? Int) ?? 20,
+                groupID: description["Group Identifier"] as? String
             )
         }
     }
@@ -132,24 +143,39 @@ final class BatteryMonitor {
             }
             return true
         }
-        return parts.isEmpty ? nil : DeviceBattery(parts: parts)
+        // Accessories that aren't connected here are listed too. If two sets match (two pairs
+        // named "AirPods Pro"), there's no telling which is connected, so show nothing.
+        let groups = Set(parts.map { $0.groupID ?? "" })
+        guard !parts.isEmpty, groups.count == 1 else { return nil }
+        return DeviceBattery(parts: parts)
     }
 
     /// Calls `onChange` whenever any power source changes, including accessory batteries.
     func startMonitoring() {
-        guard runLoopSource == nil, source == nil else { return }
+        guard runLoopSources.isEmpty, source == nil else { return }
         let context = Unmanaged.passUnretained(self).toOpaque()
-        guard let source = IOPSNotificationCreateRunLoopSource({ context in
+        let callback: IOPowerSourceCallbackType = { context in
             guard let context else { return }
             Unmanaged<BatteryMonitor>.fromOpaque(context).takeUnretainedValue().onChange?()
-        }, context)?.takeRetainedValue() else { return }
-        CFRunLoopAddSource(CFRunLoopGetMain(), source, .defaultMode)
-        runLoopSource = source
+        }
+        var sources: [CFRunLoopSource] = []
+        if let source = IOPSNotificationCreateRunLoopSource(callback, context)?.takeRetainedValue() {
+            sources.append(source)
+        }
+        if let create = Self.createAccessoryRunLoopSource, let source = create(callback, context)?.takeRetainedValue() {
+            sources.append(source)
+        }
+        // Common modes, so updates still arrive while a menu is being tracked.
+        for source in sources {
+            CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        }
+        runLoopSources = sources
     }
 
     deinit {
-        if let runLoopSource {
-            CFRunLoopRemoveSource(CFRunLoopGetMain(), runLoopSource, .defaultMode)
+        // Invalidate, not just remove, so no callback can reach this object after it's freed.
+        for source in runLoopSources {
+            CFRunLoopSourceInvalidate(source)
         }
     }
 }
